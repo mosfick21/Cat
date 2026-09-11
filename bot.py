@@ -18,7 +18,18 @@ from web3.logs import DISCARD
 ROOT = Path(__file__).resolve().parent
 CHAIN = 4663
 ADDRESS = Web3.to_checksum_address('0xCA75DF55Cc9C476DB27a7375D1fc8E794cf80721')
-RPCS = ['https://rpc.mainnet.chain.robinhood.com', 'https://robinhood.drpc.org']
+# A rented GPU can sit most of a second from the chain's own endpoint, and
+# every one of those seconds is the card standing still. A paid endpoint is a
+# CDN with points of presence everywhere, so it stays close wherever the card
+# happens to be - worth setting when the public ones are slow from your host:
+#
+#     export HASHCATS_RPC='https://...'      (or pass --rpc, repeatable)
+#
+# It is read from the environment rather than written here, because this file
+# is public and an endpoint URL carries its key.
+RPCS = [url for url in [os.environ.get('HASHCATS_RPC')] if url] + [
+    'https://rpc.mainnet.chain.robinhood.com',
+    'https://robinhood.drpc.org']
 ABI = json.loads((ROOT / 'collection-abi.json').read_text())
 EXPLORER = 'https://robinhoodchain.blockscout.com/tx/'
 
@@ -129,18 +140,60 @@ class Miner:
     def __init__(self, args, account, journal, gpu):
         self.args, self.account, self.journal, self.gpu = args, account, journal, gpu
         self.index = 0
+        self.price = 0
         self.connect()
 
     def connect(self):
         urls = self.args.rpc or RPCS
         url = urls[self.index % len(urls)]
         self.index += 1
+        self.url = url
         self.w = Web3(Web3.HTTPProvider(url, request_kwargs={'timeout': 12}))
         self.c = self.w.eth.contract(address=ADDRESS, abi=ABI)
         if self.w.eth.chain_id != CHAIN:
             raise RuntimeError('RPC returned wrong chain')
         if not self.w.eth.get_code(ADDRESS):
             raise RuntimeError('Collection contract missing')
+        self.prepare_reads(self.account.address)
+
+    def prepare_reads(self, address):
+        """The calldata for a round's reads, built once.
+
+        Five separate calls meant five round trips per refresh. From a box
+        three quarters of a second away that is nearly four seconds of every
+        cycle with the GPU idle - and the megahashes printed on screen do not
+        show it, because they only count the time the kernel was running.
+        """
+        self.read_data = [
+            self.c.functions.prevWork()._encode_transaction_data(),
+            self.c.functions.currentAnchor()._encode_transaction_data(),
+            self.c.functions.targetFor(address)._encode_transaction_data(),
+            self.c.functions.mintPrice()._encode_transaction_data(),
+        ]
+        # A constant: worth one call at startup and never again.
+        self.anchor_window = self.c.functions.ANCHOR_WINDOW().call()
+
+    def snapshot(self, block):
+        """prevWork, anchor, target and price in a single request."""
+        import urllib.request
+        body = json.dumps([
+            {'jsonrpc': '2.0', 'id': i, 'method': 'eth_call',
+             'params': [{'to': ADDRESS, 'data': data}, hex(block)]}
+            for i, data in enumerate(self.read_data)
+        ])
+        request = urllib.request.Request(
+            self.url, data=body.encode(),
+            headers={'content-type': 'application/json'})
+        answers = json.load(urllib.request.urlopen(request, timeout=12))
+        out = [None] * len(self.read_data)
+        for answer in answers:
+            if 'error' in answer:
+                raise RuntimeError('batched read failed')
+            out[answer['id']] = answer['result']
+        prev = int(out[0], 16)
+        anchor_block = int(out[1][2:66], 16)
+        anchor = bytes.fromhex(out[1][66:130])
+        return prev, anchor_block, anchor, int(out[2], 16), int(out[3], 16)
 
     def sign_and_record(self, tx):
         signed = self.account.sign_transaction(tx)
@@ -212,28 +265,73 @@ class Miner:
             return False
         return True
 
+    # Measured on a mint that was found and then lost: twelve seconds passed
+    # between the solution and giving up on it, because everything below used
+    # to be a separate round trip - ten of them, against an endpoint most of a
+    # second away. A solution dies when the next cat lands, about ten seconds.
+    # So the checks all travel together, and the only thing after them is the
+    # broadcast itself.
+    MINT_GAS = 300_000          # the contract's own figure is 99k, 171k worst case
+
     def submit(self, nonce, anchor_block, prev, anchor):
-        # CPU recheck, fresh state and exact simulation immediately before signing.
-        target = self.c.functions.targetFor(self.account.address).call()
-        if self.c.functions.prevWork().call() != prev or work(self.account.address, nonce, prev, anchor) >= target:
+        address = self.account.address
+        fn = self.c.functions.mine(nonce, anchor_block)
+        data = fn._encode_transaction_data()
+        import urllib.request
+        # The price has to be known before the simulation can carry it, and it
+        # only moves at an epoch border, so the cached one is what gets checked
+        # against the fresh read below.
+        price = self.price
+        body = json.dumps([
+            {'jsonrpc': '2.0', 'id': 0, 'method': 'eth_call',
+             'params': [{'to': ADDRESS, 'data': self.c.functions.targetFor(address)._encode_transaction_data()}, 'latest']},
+            {'jsonrpc': '2.0', 'id': 1, 'method': 'eth_call',
+             'params': [{'to': ADDRESS, 'data': self.c.functions.prevWork()._encode_transaction_data()}, 'latest']},
+            {'jsonrpc': '2.0', 'id': 2, 'method': 'eth_call',
+             'params': [{'to': ADDRESS, 'data': self.c.functions.mintPrice()._encode_transaction_data()}, 'latest']},
+            {'jsonrpc': '2.0', 'id': 3, 'method': 'eth_getTransactionCount', 'params': [address, 'latest']},
+            {'jsonrpc': '2.0', 'id': 4, 'method': 'eth_getTransactionCount', 'params': [address, 'pending']},
+            {'jsonrpc': '2.0', 'id': 5, 'method': 'eth_gasPrice', 'params': []},
+            {'jsonrpc': '2.0', 'id': 6, 'method': 'eth_getBalance', 'params': [address, 'latest']},
+            {'jsonrpc': '2.0', 'id': 7, 'method': 'eth_call',
+             'params': [{'to': ADDRESS, 'from': address, 'data': data, 'value': hex(price)}, 'latest']},
+        ])
+        request = urllib.request.Request(
+            self.url, data=body.encode(), headers={'content-type': 'application/json'})
+        answers = {a['id']: a for a in json.load(urllib.request.urlopen(request, timeout=12))}
+        if any('error' in answers[i] for i in (0, 1, 2, 3, 4, 5, 6)):
+            log('Pre-mint reads failed; continuing.')
+            return
+        target = int(answers[0]['result'], 16)
+        if int(answers[1]['result'], 16) != prev or work(address, nonce, prev, anchor) >= target:
             log('Round changed before submission; continuing.')
             return
-        price = self.c.functions.mintPrice().call()
-        fn = self.c.functions.mine(nonce, anchor_block)
-        call = {'from': self.account.address, 'value': price}
-        fn.call(call)
-        gas = (fn.estimate_gas(call) * 125 + 99) // 100
-        latest = self.w.eth.get_transaction_count(self.account.address, 'latest')
-        pending = self.w.eth.get_transaction_count(self.account.address, 'pending')
+        fresh_price = int(answers[2]['result'], 16)
+        if fresh_price != price:
+            # The simulation was carried at the old price, so it proved
+            # nothing about this one. Take the new price into the next round
+            # rather than guess.
+            self.price = fresh_price
+            log('Mint price changed between rounds; continuing.')
+            return
+        if 'error' in answers[7]:
+            log('Mint would revert right now; continuing.')
+            return
+        latest, pending = int(answers[3]['result'], 16), int(answers[4]['result'], 16)
         if latest != pending:
             log('Wallet has another pending transaction. Waiting before minting.')
             return
         tx = {'chainId': CHAIN, 'nonce': latest, 'to': ADDRESS,
-              'value': price, 'data': fn._encode_transaction_data(),
-              'gas': gas, 'gasPrice': self.w.eth.gas_price * 12 // 10 + 1}
-        if not self.affordable(tx):
+              'value': price, 'data': data,
+              'gas': self.MINT_GAS, 'gasPrice': int(answers[5]['result'], 16) * 12 // 10 + 1}
+        if int(answers[6]['result'], 16) < tx['value'] + tx['gas'] * tx['gasPrice']:
+            log('Insufficient ETH for mint + gas. Fund this mining wallet; waiting.')
             return
-        log(f'Mint price: {Web3.from_wei(price, "ether")} ETH; gas limit: {gas}')
+        if self.args.max_cost_eth is not None and \
+                tx['value'] + tx['gas'] * tx['gasPrice'] > Web3.to_wei(self.args.max_cost_eth, 'ether'):
+            log('Cost above --max-cost-eth; waiting.')
+            return
+        log(f'Mint price: {Web3.from_wei(price, "ether")} ETH; gas limit: {tx["gas"]}')
         self.sign_and_record(tx)
 
     def run(self):
@@ -260,13 +358,8 @@ class Miner:
                     continue
                 if time.monotonic() >= next_refresh:
                     block = self.w.eth.block_number
-                    def read(name, *values):
-                        return getattr(self.c.functions, name)(*values).call(block_identifier=block)
-                    prev = read('prevWork')
-                    anchor_block, anchor = read('currentAnchor')
-                    target = read('targetFor', address)
-                    price = read('mintPrice')
-                    window = read('ANCHOR_WINDOW')
+                    prev, anchor_block, anchor, target, price = self.snapshot(block)
+                    window = self.anchor_window
                     if not (0 < target < (1 << 256)):
                         raise RuntimeError('Invalid target')
                     identity = (prev, bytes(anchor))
@@ -274,6 +367,7 @@ class Miner:
                         prefix, start = secrets.randbits(192), 0
                         previous = identity
                     round_data = (prev, anchor_block, anchor, target)
+                    self.price = price
                     if block - anchor_block >= max(1, window - 3):
                         log('Waiting for a fresh usable anchor.')
                         time.sleep(1)
