@@ -56,6 +56,7 @@ class GPU:
     def __init__(self, device):
         import cupy as cp
         self.cp = cp
+        self.device = device
         cp.cuda.Device(device).use()
         self.module = cp.RawModule(code=(ROOT / 'keccak.cu').read_text(), options=('--std=c++11',))
         self.kernel = self.module.get_function('search')
@@ -86,21 +87,67 @@ class GPU:
                 raise RuntimeError('GPU target comparison self-test failed')
         log('GPU hash and target self-tests passed.')
 
-    def run(self, address, prev, anchor, target, prefix, start):
+    def launch(self, address, prev, anchor, target, prefix, start):
+        """Starts one batch and returns immediately.
+
+        Reading the result here would block until this card finished, which
+        with several cards means running them one after another - all the
+        cards, none of the speed. Launching is separated from collecting so
+        every card is working at the same time.
+        """
         cp = self.cp
-        count = min(self.batch, (1 << 64) - start)
+        cp.cuda.Device(self.device).use()
+        self.count = min(self.batch, (1 << 64) - start)
+        self.start = start
+        self.prefix = prefix
         base = cp.asarray(base_words(address, prefix, prev, anchor))
         target_words = cp.asarray(np.array([(target >> (192 - 64*i)) & ((1<<64)-1) for i in range(4)], dtype=np.uint64))
         self.found.fill(0)
-        began = time.monotonic()
-        self.kernel(((count + 127)//128,), (128,),
-                    (base, target_words, np.uint64(start), np.uint32(count), self.found, self.result))
+        self.kernel(((self.count + 127)//128,), (128,),
+                    (base, target_words, np.uint64(start), np.uint32(self.count), self.found, self.result))
+        return self.count
+
+    def collect(self, elapsed):
+        cp = self.cp
+        cp.cuda.Device(self.device).use()
         found = int(self.found.get()[0])
-        elapsed = max(time.monotonic() - began, 0.001)
         # Aim for short launches so state refresh and Ctrl+C stay responsive.
-        self.batch = max(4096, min(1 << 24, int(count * min(2, max(.5, .25 / elapsed))) // 128 * 128))
-        nonce = (prefix << 64) | int(self.result.get()[0]) if found else None
-        return nonce, count, elapsed
+        self.batch = max(4096, min(1 << 24, int(self.count * min(2, max(.5, .25 / elapsed))) // 128 * 128))
+        return (self.prefix << 64) | int(self.result.get()[0]) if found else None
+
+
+class Farm:
+    """Every card in the box, driven from one process.
+
+    Eight cards could be eight processes, but then each has its own journal
+    and none of them knows that another already minted - so the wallet buys
+    the one cat it wanted several times over. One process keeps one journal,
+    one nonce and one decision about when to stop.
+
+    The cards are given disjoint nonce ranges, so no two ever hash the same
+    candidate.
+    """
+
+    def __init__(self, devices):
+        self.cards = [GPU(device) for device in devices]
+        self.total = sum(1 for _ in self.cards)
+
+    def run(self, address, prev, anchor, target, prefix, start):
+        began = time.monotonic()
+        hashed = 0
+        # Every card is started before any of them is read, so they work at
+        # the same time. Each walks its own stretch of the nonce space, far
+        # enough from the others that they never meet.
+        for index, card in enumerate(self.cards):
+            hashed += card.launch(address, prev, anchor, target, prefix,
+                                  start + index * (1 << 48))
+        elapsed = max(time.monotonic() - began, 0.001)
+        found = None
+        for card in self.cards:
+            nonce = card.collect(elapsed)
+            if nonce is not None and found is None:
+                found = nonce
+        return found, hashed, max(time.monotonic() - began, 0.001)
 
 
 class Journal:
@@ -385,7 +432,13 @@ class Miner:
                 if start >= (1 << 64):
                     prefix, start = secrets.randbits(192), 0
                 if time.monotonic() >= next_report:
-                    log(f'{hashes/max(elapsed, .001)/1e6:.2f} MH/s | difficulty ~{256-target.bit_length()} bits | mining')
+                    rate = hashes / max(elapsed, .001)
+                    bits = 256 - target.bit_length()
+                    # What this hashrate means at this target, which is the
+                    # only number that says whether to wait or rent more.
+                    eta = (2 ** bits) / rate / 60 if rate else 0
+                    log(f'{rate/1e6:.2f} MH/s | target {bits} bits | '
+                        f'mean {eta:.1f} min | mint {Web3.from_wei(self.price, "ether")} ETH | mining')
                     hashes, elapsed = 0, 0.
                     next_report = time.monotonic() + 10
                 if nonce is not None:
@@ -411,7 +464,8 @@ class Miner:
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument('--device', type=int, default=0, help='NVIDIA GPU index (default 0)')
+    parser.add_argument('--device', type=int, action='append',
+                        help='NVIDIA GPU index; repeat for several. Default: every card found')
     parser.add_argument('--rpc', action='append', help='Custom Robinhood Chain RPC; repeat for fallback')
     parser.add_argument('--poll', type=float, default=1.0, help='Seconds between fresh chain snapshots')
     parser.add_argument('--confirmations', type=int, default=3)
@@ -423,7 +477,12 @@ def main():
     if args.max_cost_eth is not None and Web3.to_wei(args.max_cost_eth, 'ether') <= 0:
         parser.error('--max-cost-eth must be positive')
     os.umask(0o077)
-    gpu = GPU(args.device)
+    devices = args.device
+    if not devices:
+        import cupy
+        devices = list(range(cupy.cuda.runtime.getDeviceCount()))
+        log(f'Using all {len(devices)} GPU(s) found.')
+    gpu = Farm(devices)
     if args.self_test:
         return
     if not sys.stdin.isatty():
