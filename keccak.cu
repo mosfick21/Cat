@@ -1,5 +1,9 @@
 // Keccak-256, Ethereum padding. One 116-byte packed input per candidate.
-#include <stdint.h>
+//
+// No system header: this is compiled by NVRTC, which has no include path of
+// its own, so <stdint.h> fails outright on some CUDA installs. The one type
+// needed is spelled out instead.
+typedef unsigned long long uint64_t;
 #ifdef HOST_TEST
 #define DEVICE
 #else
