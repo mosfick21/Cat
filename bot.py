@@ -6,6 +6,7 @@ import getpass
 import json
 import os
 from pathlib import Path
+import math
 import secrets
 import sys
 import time
@@ -38,6 +39,16 @@ def log(message):
     print(time.strftime('%H:%M:%S'), message, flush=True)
 
 
+def fmt_span(seconds):
+    if seconds == float('inf'):
+        return 'never'
+    if seconds < 60:
+        return f'{seconds:.0f}s'
+    if seconds < 3600:
+        return f'{seconds/60:.0f}m'
+    return f'{int(seconds//3600)}h {int(seconds%3600//60):02d}m'
+
+
 def packed(address, nonce, prev, anchor):
     return bytes.fromhex(address[2:]) + nonce.to_bytes(32, 'big') + prev.to_bytes(32, 'big') + bytes(anchor)
 
@@ -63,6 +74,7 @@ class GPU:
         self.found = cp.zeros(1, dtype=cp.uint32)
         self.result = cp.zeros(1, dtype=cp.uint64)
         self.batch = 1 << 18
+        self.rate = 0.
         props = cp.cuda.runtime.getDeviceProperties(device)
         log('GPU: ' + props['name'].decode())
         # Exercise the actual compiled GPU code before using a private key.
@@ -134,20 +146,25 @@ class Farm:
 
     def run(self, address, prev, anchor, target, prefix, start):
         began = time.monotonic()
-        hashed = 0
+        counts = []
         # Every card is started before any of them is read, so they work at
         # the same time. Each walks its own stretch of the nonce space, far
         # enough from the others that they never meet.
         for index, card in enumerate(self.cards):
-            hashed += card.launch(address, prev, anchor, target, prefix,
-                                  start + index * (1 << 48))
+            counts.append(card.launch(address, prev, anchor, target, prefix,
+                                      start + index * (1 << 48)))
         elapsed = max(time.monotonic() - began, 0.001)
         found = None
         for card in self.cards:
             nonce = card.collect(elapsed)
             if nonce is not None and found is None:
                 found = nonce
-        return found, hashed, max(time.monotonic() - began, 0.001)
+        spent = max(time.monotonic() - began, 0.001)
+        # Per card, so a throttling or half-dead one shows up instead of
+        # hiding inside a healthy-looking total.
+        for card, count in zip(self.cards, counts):
+            card.rate = count / spent
+        return found, sum(counts), spent
 
 
 class Journal:
@@ -188,6 +205,9 @@ class Miner:
         self.args, self.account, self.journal, self.gpu = args, account, journal, gpu
         self.index = 0
         self.price = 0
+        self.started = self.round_began = time.monotonic()
+        self.rounds = self.minted = self.reverted = self.too_late = 0
+        self.spent = 0
         self.connect()
 
     def connect(self):
@@ -268,6 +288,7 @@ class Miner:
             if block.hash != receipt.blockHash:
                 return False
             if receipt.status == 0:
+                self.reverted += 1
                 log('Mint reverted; confirmed. Resuming GPU mining.')
                 data.update(status='mining', attempts=[])
                 self.journal.save()
@@ -279,6 +300,7 @@ class Miner:
                 log('Successful receipt without expected Mined event. Holding for verification; no new mint sent.')
                 return False
             token = int(mine[0].args.tokenId)
+            self.minted += 1
             data.update(status='done', token_id=token, confirmed_hash=attempt['hash'])
             self.journal.save()
             log(f'SUCCESS — cat #{token} minted to {self.account.address}')
@@ -351,6 +373,7 @@ class Miner:
             return
         target = int(answers[0]['result'], 16)
         if int(answers[1]['result'], 16) != prev or work(address, nonce, prev, anchor) >= target:
+            self.too_late += 1
             log('Round changed before submission; continuing.')
             return
         fresh_price = int(answers[2]['result'], 16)
@@ -379,7 +402,33 @@ class Miner:
             log('Cost above --max-cost-eth; waiting.')
             return
         log(f'Mint price: {Web3.from_wei(price, "ether")} ETH; gas limit: {tx["gas"]}')
+        self.spent += price
         self.sign_and_record(tx)
+
+
+    def report(self, rate, target):
+        """One block of everything worth knowing, every ten seconds."""
+        bits = 256 - target.bit_length()
+        per_cat = 2 ** bits
+        mean = per_cat / rate if rate else float('inf')
+        hour = 1 - math.exp(-3600 / mean) if mean and mean != float('inf') else 0
+        cards = ' '.join(f'gpu{i} {c.rate/1e9:.2f}'
+                         for i, c in enumerate(self.gpu.cards))
+        up = time.monotonic() - self.started
+        print(
+            f"\n  HASHRATE   {rate/1e9:.2f} GH/s   {len(self.gpu.cards)} GPU(s)\n"
+            f"             {cards}  GH/s\n"
+            f"  DIFFICULTY {bits} bits = {per_cat/1e12:.1f} Thashes per cat\n"
+            f"  ROUND      #{self.rounds}  {time.monotonic()-self.round_began:.1f}s old"
+            f"    restarts when anyone mints\n"
+            f"  ODDS       one cat every {fmt_span(mean)} on average"
+            f"    {hour*100:.0f}% chance within the hour\n"
+            f"  RESULTS    {self.minted} minted  {self.reverted} reverted"
+            f"  {self.too_late} too late\n"
+            f"  SPENT      {Web3.from_wei(self.spent, 'ether')} ETH"
+            f"    next cat costs {Web3.from_wei(self.price, 'ether')} ETH\n"
+            f"  UPTIME     {fmt_span(up)}\n",
+            flush=True)
 
     def run(self):
         address = self.account.address
@@ -411,6 +460,11 @@ class Miner:
                         raise RuntimeError('Invalid target')
                     identity = (prev, bytes(anchor))
                     if identity != previous:
+                        # Somebody minted, so the work behind the next cat
+                        # changed and everything searched so far is spent.
+                        if previous is not None and prev != previous[0]:
+                            self.rounds += 1
+                            self.round_began = time.monotonic()
                         prefix, start = secrets.randbits(192), 0
                         previous = identity
                     round_data = (prev, anchor_block, anchor, target)
@@ -432,13 +486,7 @@ class Miner:
                 if start >= (1 << 64):
                     prefix, start = secrets.randbits(192), 0
                 if time.monotonic() >= next_report:
-                    rate = hashes / max(elapsed, .001)
-                    bits = 256 - target.bit_length()
-                    # What this hashrate means at this target, which is the
-                    # only number that says whether to wait or rent more.
-                    eta = (2 ** bits) / rate / 60 if rate else 0
-                    log(f'{rate/1e6:.2f} MH/s | target {bits} bits | '
-                        f'mean {eta:.1f} min | mint {Web3.from_wei(self.price, "ether")} ETH | mining')
+                    self.report(hashes / max(elapsed, .001), target)
                     hashes, elapsed = 0, 0.
                     next_report = time.monotonic() + 10
                 if nonce is not None:
