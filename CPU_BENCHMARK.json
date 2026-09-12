@@ -1,0 +1,28 @@
+{
+  "timestamp_utc": "2026-09-11T22:50:45Z",
+  "devices": [
+    {
+      "type": "benchmark",
+      "device": "cpu",
+      "name": "AMD EPYC 9V74 80-Core Processor (2 threads)",
+      "baseline": {
+        "hashes": 28039333,
+        "wall_seconds": 5.058171320999918,
+        "hps": 5543373.5278181685
+      },
+      "selected": {
+        "hashes": 163446066,
+        "wall_seconds": 5.132536563000031,
+        "hps": 31845085.56222808
+      },
+      "config": {
+        "kernel": "avx512",
+        "threads": 2
+      }
+    }
+  ],
+  "sum_selected_hps": 31845085.56222808,
+  "note": "Synthetic native CPU benchmark, not live effective mining throughput. No mint was attempted.",
+  "tested_mode": "cpu only; 2 OpenMP threads; 5 seconds per configuration after tuning",
+  "environment": "Shared virtual AMD EPYC 9V74 environment; no NVIDIA GPU available here."
+}

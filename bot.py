@@ -1,577 +1,321 @@
 #!/usr/bin/env python3
-"""Hashcats: NVIDIA CUDA mining until ONE confirmed Mined event for this wallet."""
+"""Hashcats master miner: measured CUDA/CPU workers, one confirmed mint."""
 import argparse
-import fcntl
+from decimal import Decimal
 import getpass
 import json
+import math
 import os
 from pathlib import Path
-import math
-import secrets
 import sys
 import time
 
-import numpy as np
-from web3 import Web3
-from web3.exceptions import TransactionNotFound
-from web3.logs import DISCARD
+from core import Candidate, CandidateCache, Stats, RPCS, work, difficulty, expected_seconds, preview_target
+from gpu import Farm
+from rpc import RoundFeed, encoded_calls, public_calls
+from live import DEFAULT_WS
 
-ROOT = Path(__file__).resolve().parent
-CHAIN = 4663
-ADDRESS = Web3.to_checksum_address('0xCA75DF55Cc9C476DB27a7375D1fc8E794cf80721')
-# A rented GPU can sit most of a second from the chain's own endpoint, and
-# every one of those seconds is the card standing still. A paid endpoint is a
-# CDN with points of presence everywhere, so it stays close wherever the card
-# happens to be - worth setting when the public ones are slow from your host:
-#
-#     export HASHCATS_RPC='https://...'      (or pass --rpc, repeatable)
-#
-# It is read from the environment rather than written here, because this file
-# is public and an endpoint URL carries its key.
-RPCS = [url for url in [os.environ.get('HASHCATS_RPC')] if url] + [
-    'https://rpc.mainnet.chain.robinhood.com',
-    'https://robinhood.drpc.org']
-ABI = json.loads((ROOT / 'collection-abi.json').read_text())
-EXPLORER = 'https://robinhoodchain.blockscout.com/tx/'
+ROOT=Path(__file__).resolve().parent
 
 
-def log(message):
-    print(time.strftime('%H:%M:%S'), message, flush=True)
+def log(message):print(time.strftime('%H:%M:%S'),message,flush=True)
 
 
-def fmt_span(seconds):
-    if seconds == float('inf'):
-        return 'never'
-    if seconds < 60:
-        return f'{seconds:.0f}s'
-    if seconds < 3600:
-        return f'{seconds/60:.0f}m'
-    return f'{int(seconds//3600)}h {int(seconds%3600//60):02d}m'
+def args_parser():
+    p=argparse.ArgumentParser(description=__doc__)
+    p.add_argument('--benchmark',action='store_true',help='No wallet/RPC/transactions; compare old and selected kernels')
+    p.add_argument('--self-test',action='store_true',help='Compile, validate and tune selected workers, then exit without a wallet')
+    p.add_argument('--seconds',type=float,default=15,help='Benchmark seconds per kernel, baseline then selected')
+    p.add_argument('--backend',choices=('cuda','cpu','hybrid'),default='cuda',help='CUDA GPUs, native CPU, or both')
+    p.add_argument('--cpu-threads',type=int,default=0,help='0 reserves some CPU capacity for RPC/signing; otherwise explicit thread count')
+    p.add_argument('--hourly-cost',type=float,help='Total instance rental cost per hour, for synthetic hashes per dollar comparison')
+    p.add_argument('--audit-mints',action='store_true',help='Read recent Mined events: actual target, wallet repeats and mint intervals; no key/GPU')
+    p.add_argument('--audit-blocks',type=int,default=3000,help='L2 blocks to inspect with --audit-mints')
+    p.add_argument('--gpus',default='all',help='all or comma-separated visible GPU indices, e.g. 0,1')
+    p.add_argument('--device',type=int,help='Compatibility alias selecting one GPU')
+    p.add_argument('--retune',action='store_true',help='Ignore saved tuning measurements')
+    p.add_argument('--batch-ms',type=float,default=120,help='Target GPU launch duration; lower reduces stale work')
+    p.add_argument('--poll',type=float,default=.5,help='Pause between background pinned-block RPC reads')
+    p.add_argument('--max-state-age',type=float,default=8,help='Pause GPU work if snapshot exceeds this age')
+    p.add_argument('--lookahead-bits',type=int,default=8,help='Keep near-solutions for possible cooldown, 0 to disable')
+    p.add_argument('--rpc',action='append',help='Robinhood Chain RPC; repeat for fallback')
+    p.add_argument('--ws',default=DEFAULT_WS,help='Public Robinhood Chain WebSocket for immediate round changes')
+    p.add_argument('--no-ws',action='store_true',help='Use only the background RPC polling fallback')
+    p.add_argument('--network-test',action='store_true',help='Optional read-only connection/difficulty report; no GPU or key')
+    p.add_argument('--confirmations',type=int,default=3)
+    p.add_argument('--max-cost-eth',help='Maximum mint value + maximum gas cost for ONE transaction')
+    p.add_argument('--inspect',action='store_true',help='Read live rules for --address without GPU work or a key')
+    p.add_argument('--address',help='Public EVM address for --inspect')
+    a=p.parse_args()
+    if not .1<=a.poll or not 1<=a.max_state_age or not 20<=a.batch_ms<=500:
+        p.error('poll >= .1, max-state-age >= 1 and batch-ms between 20 and 500 required')
+    if not 0<=a.lookahead_bits<=16 or not a.seconds>0 or a.confirmations<1:
+        p.error('lookahead-bits 0..16, seconds > 0 and confirmations >= 1 required')
+    if a.max_cost_eth is not None:
+        value=Decimal(a.max_cost_eth)
+        if not value.is_finite() or value<=0:p.error('max-cost-eth must be positive and finite')
+    if a.inspect and not a.address:p.error('--inspect requires --address (public address only)')
+    if a.cpu_threads<0 or not 1<=a.audit_blocks<=100000:p.error('cpu-threads >= 0 and audit-blocks 1..100000 required')
+    if a.hourly_cost is not None and (not math.isfinite(a.hourly_cost) or a.hourly_cost<=0):p.error('hourly-cost must be positive and finite')
+    if not math.isfinite(a.seconds):p.error('seconds must be finite')
+    return a
 
 
-def packed(address, nonce, prev, anchor):
-    return bytes.fromhex(address[2:]) + nonce.to_bytes(32, 'big') + prev.to_bytes(32, 'big') + bytes(anchor)
+def devices_for(args):
+    if args.backend=='cpu':return ['cpu']
+    import cupy as cp
+    count=cp.cuda.runtime.getDeviceCount()
+    if not count:raise RuntimeError('No visible NVIDIA CUDA GPU')
+    if args.device is not None:devices=[args.device]
+    elif args.gpus=='all':devices=list(range(count))
+    else:devices=[int(x) for x in args.gpus.split(',')]
+    if not devices or len(set(devices))!=len(devices) or any(x<0 or x>=count for x in devices):
+        raise ValueError(f'Choose unique visible GPU indices between 0 and {count-1}')
+    return devices+(['cpu'] if args.backend=='hybrid' else [])
 
 
-def work(address, nonce, prev, anchor):
-    return int.from_bytes(Web3.keccak(packed(address, nonce, prev, anchor)), 'big')
-
-
-def base_words(address, prefix, prev, anchor):
-    data = packed(address, prefix << 64, prev, anchor) + b'\x01' + bytes(18) + b'\x80'
-    assert len(data) == 136
-    return np.frombuffer(data, dtype='<u8').copy()
-
-
-class GPU:
-    def __init__(self, device):
-        import cupy as cp
-        self.cp = cp
-        self.device = device
-        cp.cuda.Device(device).use()
-        self.module = cp.RawModule(code=(ROOT / 'keccak.cu').read_text(), options=('--std=c++11',))
-        self.kernel = self.module.get_function('search')
-        self.found = cp.zeros(1, dtype=cp.uint32)
-        self.result = cp.zeros(1, dtype=cp.uint64)
-        self.batch = 1 << 18
-        self.rate = 0.
-        props = cp.cuda.runtime.getDeviceProperties(device)
-        log('GPU: ' + props['name'].decode())
-        # Exercise the actual compiled GPU code before using a private key.
-        for i in range(4):
-            address = '0x' + secrets.token_hex(20)
-            prefix, counter, prev = secrets.randbits(192), secrets.randbits(64), secrets.randbits(256)
-            anchor = secrets.token_bytes(32)
-            base = cp.asarray(base_words(address, prefix, prev, anchor))
-            out = cp.zeros(4, dtype=cp.uint64)
-            self.module.get_function('check')((1,), (1,), (base, np.uint64(counter), out))
-            actual = b''.join(int(x).to_bytes(8, 'big') for x in out.get())
-            expected = Web3.keccak(packed(address, (prefix << 64) | counter, prev, anchor))
-            if actual != expected:
-                raise RuntimeError('GPU Keccak self-test failed')
-        # Search must accept below-target candidates and reject equality.
-        digest_int = int.from_bytes(expected, 'big')
-        for target, expected_found in [(digest_int, 0), (digest_int + 1, 1)]:
-            words = cp.asarray(np.array([(target >> (192 - 64*i)) & ((1<<64)-1) for i in range(4)], dtype=np.uint64))
-            self.found.fill(0)
-            self.kernel((1,), (1,), (base, words, np.uint64(counter), np.uint32(1), self.found, self.result))
-            if int(self.found.get()[0]) != expected_found:
-                raise RuntimeError('GPU target comparison self-test failed')
-        log('GPU hash and target self-tests passed.')
-
-    def launch(self, address, prev, anchor, target, prefix, start):
-        """Starts one batch and returns immediately.
-
-        Reading the result here would block until this card finished, which
-        with several cards means running them one after another - all the
-        cards, none of the speed. Launching is separated from collecting so
-        every card is working at the same time.
-        """
-        cp = self.cp
-        cp.cuda.Device(self.device).use()
-        self.count = min(self.batch, (1 << 64) - start)
-        self.start = start
-        self.prefix = prefix
-        base = cp.asarray(base_words(address, prefix, prev, anchor))
-        target_words = cp.asarray(np.array([(target >> (192 - 64*i)) & ((1<<64)-1) for i in range(4)], dtype=np.uint64))
-        self.found.fill(0)
-        self.kernel(((self.count + 127)//128,), (128,),
-                    (base, target_words, np.uint64(start), np.uint32(self.count), self.found, self.result))
-        return self.count
-
-    def collect(self, elapsed):
-        cp = self.cp
-        cp.cuda.Device(self.device).use()
-        found = int(self.found.get()[0])
-        # Aim for short launches so state refresh and Ctrl+C stay responsive.
-        self.batch = max(4096, min(1 << 24, int(self.count * min(2, max(.5, .25 / elapsed))) // 128 * 128))
-        return (self.prefix << 64) | int(self.result.get()[0]) if found else None
-
-
-class Farm:
-    """Every card in the box, driven from one process.
-
-    Eight cards could be eight processes, but then each has its own journal
-    and none of them knows that another already minted - so the wallet buys
-    the one cat it wanted several times over. One process keeps one journal,
-    one nonce and one decision about when to stop.
-
-    The cards are given disjoint nonce ranges, so no two ever hash the same
-    candidate.
-    """
-
-    def __init__(self, devices):
-        self.cards = [GPU(device) for device in devices]
-        self.total = sum(1 for _ in self.cards)
-
-    def run(self, address, prev, anchor, target, prefix, start):
-        began = time.monotonic()
-        counts = []
-        # Every card is started before any of them is read, so they work at
-        # the same time. Each walks its own stretch of the nonce space, far
-        # enough from the others that they never meet.
-        for index, card in enumerate(self.cards):
-            counts.append(card.launch(address, prev, anchor, target, prefix,
-                                      start + index * (1 << 48)))
-        elapsed = max(time.monotonic() - began, 0.001)
-        found = None
-        for card in self.cards:
-            nonce = card.collect(elapsed)
-            if nonce is not None and found is None:
-                found = nonce
-        spent = max(time.monotonic() - began, 0.001)
-        # Per card, so a throttling or half-dead one shows up instead of
-        # hiding inside a healthy-looking total.
-        for card, count in zip(self.cards, counts):
-            card.rate = count / spent
-        return found, sum(counts), spent
-
-
-class Journal:
-    def __init__(self, wallet):
-        folder = ROOT / 'state'
-        folder.mkdir(mode=0o700, exist_ok=True)
-        self.needs_save = False
-        self.path = folder / (wallet.lower() + '.json')
-        self.lock = open(folder / (wallet.lower() + '.lock'), 'a')
-        try:
-            fcntl.flock(self.lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
-        except Exception:
-            self.lock.close()
-            raise
-        self.data = json.loads(self.path.read_text()) if self.path.exists() else {'wallet': wallet, 'chain': CHAIN, 'contract': ADDRESS, 'status': 'mining'}
-        if (self.data['wallet'].lower(), self.data['chain'], self.data['contract'].lower()) != (wallet.lower(), CHAIN, ADDRESS.lower()):
-            raise RuntimeError('State identity mismatch')
-
-    def save(self):
-        self.needs_save = True
-        temp = self.path.with_suffix('.tmp')
-        fd = os.open(temp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
-        with os.fdopen(fd, 'w') as f:
-            json.dump(self.data, f, indent=2)
-            f.flush()
-            os.fsync(f.fileno())
-        os.replace(temp, self.path)
-        fd = os.open(self.path.parent, os.O_RDONLY | os.O_DIRECTORY)
-        try:
-            os.fsync(fd)
-        finally:
-            os.close(fd)
-        self.needs_save = False
-
-
-class Miner:
-    def __init__(self, args, account, journal, gpu):
-        self.args, self.account, self.journal, self.gpu = args, account, journal, gpu
-        self.index = 0
-        self.price = 0
-        self.started = self.round_began = time.monotonic()
-        self.rounds = self.minted = self.reverted = self.too_late = 0
-        self.spent = 0
-        self.connect()
-
-    def connect(self):
-        urls = self.args.rpc or RPCS
-        url = urls[self.index % len(urls)]
-        self.index += 1
-        self.url = url
-        self.w = Web3(Web3.HTTPProvider(url, request_kwargs={'timeout': 12}))
-        self.c = self.w.eth.contract(address=ADDRESS, abi=ABI)
-        if self.w.eth.chain_id != CHAIN:
-            raise RuntimeError('RPC returned wrong chain')
-        if not self.w.eth.get_code(ADDRESS):
-            raise RuntimeError('Collection contract missing')
-        self.prepare_reads(self.account.address)
-
-    def prepare_reads(self, address):
-        """The calldata for a round's reads, built once.
-
-        Five separate calls meant five round trips per refresh. From a box
-        three quarters of a second away that is nearly four seconds of every
-        cycle with the GPU idle - and the megahashes printed on screen do not
-        show it, because they only count the time the kernel was running.
-        """
-        self.read_data = [
-            self.c.functions.prevWork()._encode_transaction_data(),
-            self.c.functions.currentAnchor()._encode_transaction_data(),
-            self.c.functions.targetFor(address)._encode_transaction_data(),
-            self.c.functions.mintPrice()._encode_transaction_data(),
-        ]
-        # A constant: worth one call at startup and never again.
-        self.anchor_window = self.c.functions.ANCHOR_WINDOW().call()
-
-    def snapshot(self, block):
-        """prevWork, anchor, target and price in a single request."""
-        import urllib.request
-        body = json.dumps([
-            {'jsonrpc': '2.0', 'id': i, 'method': 'eth_call',
-             'params': [{'to': ADDRESS, 'data': data}, hex(block)]}
-            for i, data in enumerate(self.read_data)
-        ])
-        request = urllib.request.Request(
-            self.url, data=body.encode(),
-            headers={'content-type': 'application/json'})
-        answers = json.load(urllib.request.urlopen(request, timeout=12))
-        out = [None] * len(self.read_data)
-        for answer in answers:
-            if 'error' in answer:
-                raise RuntimeError('batched read failed')
-            out[answer['id']] = answer['result']
-        prev = int(out[0], 16)
-        anchor_block = int(out[1][2:66], 16)
-        anchor = bytes.fromhex(out[1][66:130])
-        return prev, anchor_block, anchor, int(out[2], 16), int(out[3], 16)
-
-    def sign_and_record(self, tx):
-        signed = self.account.sign_transaction(tx)
-        raw = Web3.to_hex(signed.raw_transaction)
-        tx_hash = Web3.to_hex(signed.hash)
-        data = self.journal.data
-        if data['status'] != 'pending':
-            data.update(status='pending', attempts=[])
-        data.update(tx=tx, updated=time.time())
-        data['attempts'].append({'hash': tx_hash, 'raw': raw})
-        self.journal.save()  # MUST happen before broadcasting.
-        log('Submitting mint: ' + EXPLORER + tx_hash)
-        self.w.eth.send_raw_transaction(signed.raw_transaction)
-
-    def pending(self):
-        data = self.journal.data
-        for attempt in reversed(data['attempts']):
-            try:
-                receipt = self.w.eth.get_transaction_receipt(attempt['hash'])
-            except TransactionNotFound:
-                continue
-            if self.w.eth.block_number < receipt.blockNumber + self.args.confirmations - 1:
-                return False
-            block = self.w.eth.get_block(receipt.blockNumber)
-            if block.hash != receipt.blockHash:
-                return False
-            if receipt.status == 0:
-                self.reverted += 1
-                log('Mint reverted; confirmed. Resuming GPU mining.')
-                data.update(status='mining', attempts=[])
-                self.journal.save()
-                return False
-            events = self.c.events.Mined().process_receipt(receipt, errors=DISCARD)
-            mine = [x for x in events if x.address.lower() == ADDRESS.lower() and x.args.miner.lower() == self.account.address.lower()]
-            if not mine:
-                # Never risk a second mint when a successful receipt is ambiguous.
-                log('Successful receipt without expected Mined event. Holding for verification; no new mint sent.')
-                return False
-            token = int(mine[0].args.tokenId)
-            self.minted += 1
-            data.update(status='done', token_id=token, confirmed_hash=attempt['hash'])
-            self.journal.save()
-            log(f'SUCCESS — cat #{token} minted to {self.account.address}')
-            log(EXPLORER + attempt['hash'])
-            return True
-        latest_nonce = self.w.eth.get_transaction_count(self.account.address, 'latest')
-        if latest_nonce > data['tx']['nonce']:
-            log('Nonce consumed but recorded receipt unavailable. Waiting; no duplicate mint.')
-            return False
-        if time.time() - data['updated'] > 120:
-            tx = dict(data['tx'])
-            tx['gasPrice'] = max(tx['gasPrice'] * 113 // 100 + 1, self.w.eth.gas_price * 12 // 10)
-            if self.affordable(tx):
-                self.sign_and_record(tx)  # Same nonce, destination, calldata and value.
-                return False
-        # Rebroadcast identical bytes: its hash and nonce cannot create another mint.
-        try:
-            self.w.eth.send_raw_transaction(bytes.fromhex(data['attempts'][-1]['raw'][2:]))
-        except Exception:
-            pass
-        log('Waiting for mint confirmation...')
-        return False
-
-    def affordable(self, tx):
-        cost = tx['value'] + tx['gas'] * tx['gasPrice']
-        if self.args.max_cost_eth is not None and cost > Web3.to_wei(self.args.max_cost_eth, 'ether'):
-            log('Cost above --max-cost-eth; waiting.')
-            return False
-        if self.w.eth.get_balance(self.account.address) < cost:
-            log('Insufficient ETH for mint + gas. Fund this mining wallet on Robinhood Chain; waiting.')
-            return False
-        return True
-
-    # Measured on a mint that was found and then lost: twelve seconds passed
-    # between the solution and giving up on it, because everything below used
-    # to be a separate round trip - ten of them, against an endpoint most of a
-    # second away. A solution dies when the next cat lands, about ten seconds.
-    # So the checks all travel together, and the only thing after them is the
-    # broadcast itself.
-    MINT_GAS = 300_000          # the contract's own figure is 99k, 171k worst case
-
-    def submit(self, nonce, anchor_block, prev, anchor):
-        address = self.account.address
-        fn = self.c.functions.mine(nonce, anchor_block)
-        data = fn._encode_transaction_data()
-        import urllib.request
-        # The price has to be known before the simulation can carry it, and it
-        # only moves at an epoch border, so the cached one is what gets checked
-        # against the fresh read below.
-        price = self.price
-        body = json.dumps([
-            {'jsonrpc': '2.0', 'id': 0, 'method': 'eth_call',
-             'params': [{'to': ADDRESS, 'data': self.c.functions.targetFor(address)._encode_transaction_data()}, 'latest']},
-            {'jsonrpc': '2.0', 'id': 1, 'method': 'eth_call',
-             'params': [{'to': ADDRESS, 'data': self.c.functions.prevWork()._encode_transaction_data()}, 'latest']},
-            {'jsonrpc': '2.0', 'id': 2, 'method': 'eth_call',
-             'params': [{'to': ADDRESS, 'data': self.c.functions.mintPrice()._encode_transaction_data()}, 'latest']},
-            {'jsonrpc': '2.0', 'id': 3, 'method': 'eth_getTransactionCount', 'params': [address, 'latest']},
-            {'jsonrpc': '2.0', 'id': 4, 'method': 'eth_getTransactionCount', 'params': [address, 'pending']},
-            {'jsonrpc': '2.0', 'id': 5, 'method': 'eth_gasPrice', 'params': []},
-            {'jsonrpc': '2.0', 'id': 6, 'method': 'eth_getBalance', 'params': [address, 'latest']},
-            {'jsonrpc': '2.0', 'id': 7, 'method': 'eth_call',
-             'params': [{'to': ADDRESS, 'from': address, 'data': data, 'value': hex(price)}, 'latest']},
-        ])
-        request = urllib.request.Request(
-            self.url, data=body.encode(), headers={'content-type': 'application/json'})
-        answers = {a['id']: a for a in json.load(urllib.request.urlopen(request, timeout=12))}
-        if any('error' in answers[i] for i in (0, 1, 2, 3, 4, 5, 6)):
-            log('Pre-mint reads failed; continuing.')
+def wait_for_gpus(farm,benchmark=False,hourly_cost=None,backend='cuda'):
+    ready=set();reports={}
+    last_activity=time.monotonic()
+    while True:
+        for msg in farm.drain():
+            last_activity=time.monotonic()
+            if msg['type']=='error':raise RuntimeError(f'Worker {msg["device"]}: {msg["error"]}')
+            if msg['type']=='status':log(f'Worker {msg["device"]}: {msg["message"]}')
+            if msg['type']=='ready':
+                ready.add(msg['device']);farm.ready[msg['device']]=msg
+                log(f'Worker {msg["device"]}: {msg["name"]}; selected {msg["config"]["kernel"]}')
+            if msg['type']=='benchmark':
+                reports[msg['device']]=msg
+                old,new=msg['baseline']['hps'],msg['selected']['hps']
+                log(f'Worker {msg["device"]} measured: baseline {old/1e6:.2f} MH/s; '
+                    f'selected {new/1e6:.2f} MH/s; ratio {new/old:.2f}x')
+        if len(ready)==len(farm.processes) and not benchmark:return
+        if benchmark and len(reports)==len(farm.processes):
+            path=ROOT/'benchmark.json'
+            rate=sum(x['selected']['hps'] for x in reports.values())
+            summary={'timestamp_utc':time.strftime('%Y-%m-%dT%H:%M:%SZ',time.gmtime()),
+                     'devices':list(reports.values()),'sum_selected_hps':rate,
+                     'note':'Synthetic worker rates; phases can overlap differently. Live effective rate must be measured separately.'}
+            if hourly_cost is not None:
+                summary.update(hourly_cost=hourly_cost,synthetic_gh_per_dollar=rate*3600/hourly_cost/1e9)
+                log(f'Synthetic estimate {summary["synthetic_gh_per_dollar"]:.2f} GH per rental dollar; not a profit forecast.')
+            path.write_text(json.dumps(summary,indent=2))
+            (ROOT/f'benchmark-{backend}.json').write_text(json.dumps(summary,indent=2))
+            log(f'Saved benchmark-{backend}.json and benchmark.json. No key was requested and no transaction was sent.')
             return
-        target = int(answers[0]['result'], 16)
-        if int(answers[1]['result'], 16) != prev or work(address, nonce, prev, anchor) >= target:
-            self.too_late += 1
-            log('Round changed before submission; continuing.')
-            return
-        fresh_price = int(answers[2]['result'], 16)
-        if fresh_price != price:
-            # The simulation was carried at the old price, so it proved
-            # nothing about this one. Take the new price into the next round
-            # rather than guess.
-            self.price = fresh_price
-            log('Mint price changed between rounds; continuing.')
-            return
-        if 'error' in answers[7]:
-            log('Mint would revert right now; continuing.')
-            return
-        latest, pending = int(answers[3]['result'], 16), int(answers[4]['result'], 16)
-        if latest != pending:
-            log('Wallet has another pending transaction. Waiting before minting.')
-            return
-        tx = {'chainId': CHAIN, 'nonce': latest, 'to': ADDRESS,
-              'value': price, 'data': data,
-              'gas': self.MINT_GAS, 'gasPrice': int(answers[5]['result'], 16) * 12 // 10 + 1}
-        if int(answers[6]['result'], 16) < tx['value'] + tx['gas'] * tx['gasPrice']:
-            log('Insufficient ETH for mint + gas. Fund this mining wallet; waiting.')
-            return
-        if self.args.max_cost_eth is not None and \
-                tx['value'] + tx['gas'] * tx['gasPrice'] > Web3.to_wei(self.args.max_cost_eth, 'ether'):
-            log('Cost above --max-cost-eth; waiting.')
-            return
-        log(f'Mint price: {Web3.from_wei(price, "ether")} ETH; gas limit: {tx["gas"]}')
-        self.spent += price
-        self.sign_and_record(tx)
+        for device,proc in farm.processes.items():
+            if proc.exitcode is not None and (not benchmark or device not in reports):
+                # Allow the multiprocessing queue feeder to deliver final output first.
+                if proc.exitcode!=0:raise RuntimeError(f'GPU worker {device} exited with {proc.exitcode}')
+        if time.monotonic()-last_activity>max(180,2*getattr(farm,'benchmark_seconds',15)+60):
+            raise RuntimeError('GPU initialization/benchmark stopped reporting progress')
+        time.sleep(.1)
 
 
-    def report(self, rate, target):
-        """One block of everything worth knowing, every ten seconds."""
-        bits = 256 - target.bit_length()
-        per_cat = 2 ** bits
-        mean = per_cat / rate if rate else float('inf')
-        hour = 1 - math.exp(-3600 / mean) if mean and mean != float('inf') else 0
-        cards = ' '.join(f'gpu{i} {c.rate/1e9:.2f}'
-                         for i, c in enumerate(self.gpu.cards))
-        up = time.monotonic() - self.started
-        print(
-            f"\n  HASHRATE   {rate/1e9:.2f} GH/s   {len(self.gpu.cards)} GPU(s)\n"
-            f"             {cards}  GH/s\n"
-            f"  DIFFICULTY {bits} bits = {per_cat/1e12:.1f} Thashes per cat\n"
-            f"  ROUND      #{self.rounds}  {time.monotonic()-self.round_began:.1f}s old"
-            f"    restarts when anyone mints\n"
-            f"  ODDS       one cat every {fmt_span(mean)} on average"
-            f"    {hour*100:.0f}% chance within the hour\n"
-            f"  RESULTS    {self.minted} minted  {self.reverted} reverted"
-            f"  {self.too_late} too late\n"
-            f"  SPENT      {Web3.from_wei(self.spent, 'ether')} ETH"
-            f"    next cat costs {Web3.from_wei(self.price, 'ether')} ETH\n"
-            f"  UPTIME     {fmt_span(up)}\n",
-            flush=True)
+def make_feed(manager,args,address):
+    return RoundFeed(args.rpc or RPCS,encoded_calls(manager.c,address),address,args.poll,args.max_state_age,
+                     None if args.no_ws else args.ws)
 
-    def run(self):
-        address = self.account.address
-        prefix, start = secrets.randbits(192), 0
-        previous = None
-        next_refresh, next_report = 0., 0.
-        hashes, elapsed = 0, 0.
-        delay = 2
-        round_data = None
+
+def connect_manager(args,account,journal):
+    from transactions import TxManager
+    while True:
+        try:return TxManager(args,account,journal)
+        except Exception as exc:
+            log(f'RPC startup {type(exc).__name__}; trying another endpoint in 3s.')
+            urls=args.rpc or RPCS;args.rpc=urls[1:]+urls[:1]
+            time.sleep(3)
+
+
+def inspect(args):
+    from web3 import Web3
+    from transactions import ABI,ADDRESS
+    address=Web3.to_checksum_address(args.address)
+    w=Web3();c=w.eth.contract(address=ADDRESS,abi=ABI)
+    feed=RoundFeed(args.rpc or RPCS,encoded_calls(c,address),address,args.poll,args.max_state_age)
+    feed.start();end=time.monotonic()+45
+    try:
+        while time.monotonic()<end:
+            sample=feed.fresh()
+            if sample is not None:
+                print(json.dumps({'wallet':address,'block':sample['block'],
+                    'wallet_bits':difficulty(sample['targetFor']),
+                    'network_bits':difficulty(sample['currentTarget']),
+                    'base_bits':difficulty(sample['baseTarget']),
+                    'wallet_streak':sample['personalBurst'],'network_streak':sample['currentBurst'],
+                    'wallet_vs_network_work_factor':sample['currentTarget']/sample['targetFor'],
+                    'epoch':sample['currentEpoch'],'total_minted':sample['totalMinted'],
+                    'mint_price_eth':str(Web3.from_wei(sample['mintPrice'],'ether')),
+                    'balance_eth':str(Web3.from_wei(sample['balance'],'ether')),
+                    'pace_plan_seconds':sample['pacePlan'],'rpc_seconds':sample['rpc_seconds']},indent=2))
+                return
+            time.sleep(.1)
+        raise RuntimeError('No fresh RPC snapshot within 45 seconds')
+    finally:feed.stop()
+
+
+def network_test(args):
+    address=args.address or '0x0000000000000000000000000000000000000000'
+    feed=RoundFeed(args.rpc or RPCS,public_calls(address),address,args.poll,args.max_state_age,
+                   None if args.no_ws else args.ws)
+    feed.start();end=time.monotonic()+args.seconds;latest=None
+    try:
+        while time.monotonic()<end:
+            sample=feed.fresh()
+            if sample is not None and not sample.get('provisional'):
+                latest={'block':sample['block'],'wallet_bits':difficulty(sample['targetFor']),
+                        'network_bits':difficulty(sample['currentTarget']),
+                        'wallet_streak':sample['personalBurst'],
+                        'wallet_vs_network_work_factor':sample['currentTarget']/sample['targetFor']}
+            time.sleep(.1)
+        report={'public_wallet':address,'last_confirmed_snapshot':latest,'connections':feed.status(),
+                'note':'Read-only diagnostic; no key, GPU, or transaction. A wallet count is not proof of a three-mint limit.'}
+        (ROOT/'network-test.json').write_text(json.dumps(report,indent=2))
+        print(json.dumps(report,indent=2))
+        if latest is None:raise RuntimeError('No fresh RPC snapshot received; see network-test.json')
+    finally:feed.stop()
+
+
+def mine(args,farm,manager,account,journal):
+    from web3 import Web3
+    address=account.address
+    # Verifies the production contract and an independent hash implementation.
+    actual=manager.c.functions.workHash(address,123,456,bytes(32)).call()
+    if actual!=work(address,123,456,bytes(32)):
+        raise RuntimeError('Contract workHash differs; refuse to sign')
+    feed=make_feed(manager,args,address)
+    cache=CandidateCache();stats=Stats();interval=Stats()
+    last_job=None;last_print=time.monotonic();last_submit=0;next_warning=0;was_pending=False
+    feed.start()
+    try:
         while True:
-            try:
-                # Retry any failed durable write BEFORE any broadcast or stop.
-                if self.journal.needs_save:
-                    self.journal.save()
-                if self.journal.data['status'] == 'done':
-                    log(f'Already completed: cat #{self.journal.data["token_id"]}. Stopping.')
-                    return
-                if self.journal.data['status'] == 'pending':
-                    if self.pending():
-                        return
-                    time.sleep(3)
-                    next_refresh = 0
-                    continue
-                if time.monotonic() >= next_refresh:
-                    block = self.w.eth.block_number
-                    prev, anchor_block, anchor, target, price = self.snapshot(block)
-                    window = self.anchor_window
-                    if not (0 < target < (1 << 256)):
-                        raise RuntimeError('Invalid target')
-                    identity = (prev, bytes(anchor))
-                    if identity != previous:
-                        # Somebody minted, so the work behind the next cat
-                        # changed and everything searched so far is spent.
-                        if previous is not None and prev != previous[0]:
-                            self.rounds += 1
-                            self.round_began = time.monotonic()
-                        prefix, start = secrets.randbits(192), 0
-                        previous = identity
-                    round_data = (prev, anchor_block, anchor, target)
-                    self.price = price
-                    if block - anchor_block >= max(1, window - 3):
-                        log('Waiting for a fresh usable anchor.')
-                        time.sleep(1)
-                        continue
-                    if self.w.eth.get_balance(address) <= price:
-                        log('Waiting for enough Robinhood Chain ETH for mint and gas.')
-                        time.sleep(15)
-                        continue
-                    next_refresh = time.monotonic() + self.args.poll
-                prev, anchor_block, anchor, target = round_data
-                nonce, count, seconds = self.gpu.run(address, prev, anchor, target, prefix, start)
-                hashes += count
-                elapsed += seconds
-                start += count
-                if start >= (1 << 64):
-                    prefix, start = secrets.randbits(192), 0
-                if time.monotonic() >= next_report:
-                    self.report(hashes / max(elapsed, .001), target)
-                    hashes, elapsed = 0, 0.
-                    next_report = time.monotonic() + 10
-                if nonce is not None:
-                    if work(address, nonce, prev, anchor) >= target:
-                        raise RuntimeError('GPU candidate failed independent CPU verification')
-                    log('Valid work found. Simulating mint...')
-                    self.submit(nonce, anchor_block, prev, anchor)
-                    next_refresh = 0
-                delay = 2
-            except KeyboardInterrupt:
-                raise
-            except Exception as exc:
-                # Do not print request payloads or secret-containing tracebacks.
-                log(f'{type(exc).__name__}; retrying in {delay}s. Pending state is preserved.')
-                time.sleep(delay)
-                delay = min(30, delay * 2)
-                next_refresh = 0
+            if journal.needs_save:journal.save()
+            if journal.data['status']=='done':
+                log(f'Completed: cat #{journal.data["token_id"]}. No second mint will be sent.')
+                return
+            sample=feed.fresh();now=time.monotonic()
+            for msg in farm.drain():
+                if msg['type']=='error':raise RuntimeError(f'GPU {msg["device"]}: {msg["error"]}')
+                if msg['type']=='work':
+                    current=(sample is not None and msg['prev']==sample['prevWork'] and
+                             0<sample['block']-msg['anchor_block']<sample['ANCHOR_WINDOW'] and now<=msg['deadline'])
+                    stats.add(msg['device'],msg['count'],msg['gpu_seconds'],current)
+                    interval.add(msg['device'],msg['count'],msg['gpu_seconds'],current)
+                if msg['type']=='candidate':
+                    cache.add(Candidate(nonce=msg['nonce'],prev=msg['prev'],anchor=msg['anchor'],
+                        anchor_block=msg['anchor_block'],digest=msg['digest'],device=msg['device']))
+            for device,process in farm.processes.items():
+                if process.exitcode is not None:
+                    raise RuntimeError(f'Worker {device} stopped; last journal retained')
+            if journal.data['status']=='pending':
+                farm.dispatch(None);last_job=None;feed.paused.set();was_pending=True
                 try:
-                    self.connect()
-                except Exception:
-                    pass
+                    if manager.pending():return
+                except Exception as exc:
+                    log(f'Pending transaction {type(exc).__name__}; retaining the same nonce.')
+                    try:manager.connect()
+                    except Exception:pass
+                time.sleep(2)
+                continue
+            if was_pending:
+                feed.invalidate();cache.clear();sample=None;was_pending=False
+            feed.paused.clear()
+            if sample is None:
+                if last_job is not None:farm.dispatch(None);last_job=None
+                if now>=next_warning:
+                    log('Waiting for a fresh RPC snapshot. Expired jobs are paused.')
+                    next_warning=now+10
+                time.sleep(.1)
+                continue
+            cache.prune(sample)
+            if sample['balance']<=sample['mintPrice']:
+                if last_job is not None:farm.dispatch(None);last_job=None
+                if now>=next_warning:
+                    log(f'Need Robinhood Chain ETH: mint price {Web3.from_wei(sample["mintPrice"],"ether")} ETH + gas.')
+                    next_warning=now+15
+                time.sleep(.2)
+                continue
+            revision=sample.get('revision',sample['started'])
+            if revision!=last_job:
+                farm.dispatch(dict(address=address,prev=sample['prevWork'],anchor=sample['anchor'],
+                    anchor_block=sample['anchor_block'],target=sample['targetFor'],
+                    search_target=preview_target(sample['targetFor'],args.lookahead_bits),
+                    deadline=sample['deadline']))
+                last_job=revision
+            if now-last_print>=10:
+                rate,eligible=interval.rates(now);total_rate,total_eligible=stats.rates(now)
+                bits=difficulty(sample['targetFor']);net=difficulty(sample['currentTarget'])
+                ws=feed.status()['websocket']
+                updates='WS live' if ws['connected'] else 'RPC polling'
+                if sample.get('provisional'):updates+='; target refreshing'
+                log(f'{len(farm.processes)} workers | effective {rate/1e6:.2f} MH/s | '
+                    f'current-round {eligible/1e6:.2f} MH/s | yours {bits:.2f} bits | '
+                    f'network {net:.2f} | wallet penalty {sample["currentTarget"]/sample["targetFor"]:.2f}x | '
+                    f'streak {sample["personalBurst"]} | {updates}')
+                if now-stats.started>=30 and total_eligible>0 and not sample.get('provisional'):
+                    hours=expected_seconds(sample['targetFor'],total_eligible)/3600
+                    log(f'At this target/rate held constant: statistical mean {hours:.2f}h; '
+                        'this is not a completion deadline.')
+                interval=Stats(now);last_print=now
+            candidate=cache.ready(sample)
+            if candidate is not None and now-last_submit>=2:
+                # Only this process has the key. All GPUs are paused before signing.
+                farm.dispatch(None);last_job=None;last_submit=now
+                try:
+                    if work(address,candidate.nonce,candidate.prev,candidate.anchor)!=candidate.digest:
+                        raise RuntimeError('Candidate failed signer-side CPU validation')
+                    log(f'Worker {candidate.device} has eligible work. Simulating before signing...')
+                    manager.submit(candidate.nonce,candidate.anchor_block,candidate.prev,
+                                   candidate.anchor,sample['mintPrice'])
+                except Exception as exc:
+                    log(f'Submission {type(exc).__name__}; candidate retained while valid.')
+                    try:manager.connect()
+                    except Exception:pass
+            time.sleep(.02)
+    finally:
+        farm.dispatch(None);feed.stop()
 
 
 def main():
-    parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument('--device', type=int, action='append',
-                        help='NVIDIA GPU index; repeat for several. Default: every card found')
-    parser.add_argument('--rpc', action='append', help='Custom Robinhood Chain RPC; repeat for fallback')
-    parser.add_argument('--poll', type=float, default=1.0, help='Seconds between fresh chain snapshots')
-    parser.add_argument('--confirmations', type=int, default=3)
-    parser.add_argument('--max-cost-eth', help='Optional maximum mint value + gas limit * gas price per transaction')
-    parser.add_argument('--self-test', action='store_true', help='GPU tests only: no wallet or transaction')
-    args = parser.parse_args()
-    if args.poll < .1 or args.confirmations < 1:
-        parser.error('poll must be >= 0.1 and confirmations >= 1')
-    if args.max_cost_eth is not None and Web3.to_wei(args.max_cost_eth, 'ether') <= 0:
-        parser.error('--max-cost-eth must be positive')
-    os.umask(0o077)
-    devices = args.device
-    if not devices:
-        import cupy
-        devices = list(range(cupy.cuda.runtime.getDeviceCount()))
-        log(f'Using all {len(devices)} GPU(s) found.')
-    gpu = Farm(devices)
-    if args.self_test:
-        return
-    if not sys.stdin.isatty():
-        raise RuntimeError('Run inside an interactive terminal/tmux; hidden private-key input required')
-    while True:
-        key = getpass.getpass('Mining wallet private key (hidden): ').strip()
-        try:
-            account = Web3().eth.account.from_key(key)
-            break
-        except Exception:
-            print('Invalid EVM private key. Expected 64 hex characters, optional 0x.')
-        finally:
-            key = None
-    log('Wallet: ' + account.address)
-    log('Only mine(nonce, anchorBlock) will be signed. No token approvals or transfers.')
-    journal = Journal(account.address)
-    # Retry startup RPC failures too; the key stays in this process only.
-    while True:
-        try:
-            miner = Miner(args, account, journal, gpu)
-            # Verify packed encoding against the actual contract before mining.
-            anchor = bytes(32)
-            actual = miner.c.functions.workHash(account.address, 123, 456, anchor).call()
-            if actual != work(account.address, 123, 456, anchor):
-                raise RuntimeError('On-chain workHash mismatch')
-            break
-        except Exception as exc:
-            log(f'Startup {type(exc).__name__}; retrying in 10s.')
-            time.sleep(10)
-            # Try the next endpoint even if constructor connectivity failed.
-            urls = args.rpc or RPCS
-            args.rpc = urls[1:] + urls[:1]
-    miner.run()
-
-
-if __name__ == '__main__':
+    args=args_parser();os.umask(0o077)
+    if args.network_test:return network_test(args)
+    if args.audit_mints:
+        from mint_audit import run
+        return run(args.rpc or RPCS,args.audit_blocks,ROOT/'mint-audit.json')
+    if args.inspect:return inspect(args)
+    devices=devices_for(args)
+    log('Selected workers: '+','.join(map(str,devices)))
+    options=dict(benchmark=args.benchmark,seconds=args.seconds,retune=args.retune,
+                 batch_ms=args.batch_ms,cpu_threads=args.cpu_threads)
+    farm=Farm(devices,options);farm.benchmark_seconds=args.seconds;farm.start()
     try:
-        main()
+        wait_for_gpus(farm,args.benchmark,args.hourly_cost,args.backend)
+        if args.benchmark or args.self_test:return
+        if not sys.stdin.isatty():raise RuntimeError('An interactive terminal is required for hidden key input')
+        from web3 import Web3
+        from transactions import Journal
+        while True:
+            key=getpass.getpass('Mining wallet private key (hidden): ').strip()
+            try:
+                account=Web3().eth.account.from_key(key)
+                break
+            except Exception:print('Expected a 32-byte EVM private key, optional 0x prefix.')
+            finally:key=None
+        log('Wallet: '+account.address)
+        log('Only Hashcats mine(nonce, anchorBlock) transactions are signed.')
+        journal=Journal(account.address)
+        if journal.data['status']=='done':
+            log(f'Already minted cat #{journal.data["token_id"]}; stopping.')
+            return
+        manager=connect_manager(args,account,journal)
+        mine(args,farm,manager,account,journal)
+    finally:farm.stop()
+
+
+if __name__=='__main__':
+    try:main()
     except KeyboardInterrupt:
-        log('Stopped by user. Run again to recover any pending mint.')
-        sys.exit(130)
+        log('Stopped. Preserve state/ for pending transaction recovery.');sys.exit(130)
     except Exception as exc:
-        log(f'Cannot start ({type(exc).__name__}): {str(exc)[:160]}')
-        sys.exit(1)
+        log(f'Cannot continue: {type(exc).__name__}: {str(exc)[:240]}');sys.exit(1)
