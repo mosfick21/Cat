@@ -50,7 +50,7 @@ def hasher(rank: int, root: int, options: dict, run_for: float):
     import sys
     sys.path.insert(0, '/root/miner')
     from core import make_prefix, work
-    from gpu import Driver
+    from gpu import Driver, benchmark_driver
 
     dictionary, results = _handles()
     device = f'modal-{rank}'
@@ -61,6 +61,19 @@ def hasher(rank: int, root: int, options: dict, run_for: float):
         config, scores = driver.tune(options.get('retune', False),
                                      lambda message: put(type='status', message=message))
         put(type='ready', name=driver.name, config=config, scores=scores)
+
+        # Measuring the rented card is the whole reason to rent one card
+        # before renting ten, so it happens here rather than on a laptop that
+        # has no such GPU in it.
+        if options.get('benchmark'):
+            baseline = max((s for s in scores if s['config']['kernel'] == 'reference'),
+                           key=lambda s: s['hps'])['config']
+            seconds = options.get('seconds', 15)
+            old_rate = benchmark_driver(driver, baseline, seconds)
+            new_rate = benchmark_driver(driver, config, seconds)
+            put(type='benchmark', name=driver.name, baseline=old_rate,
+                selected=new_rate, config=config)
+            return
 
         # The job is read here, off the hashing path, so that a round change
         # never costs a batch.

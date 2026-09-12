@@ -58,7 +58,6 @@ def args_parser():
     if a.inspect and not a.address:p.error('--inspect requires --address (public address only)')
     if a.cpu_threads<0 or not 1<=a.audit_blocks<=100000:p.error('cpu-threads >= 0 and audit-blocks 1..100000 required')
     if not 1<=a.modal_gpus<=50:p.error('modal-gpus 1..50 required')
-    if a.backend=='modal' and a.benchmark:p.error('--benchmark measures local hardware; run it on the rented GPU itself')
     if a.hourly_cost is not None and (not math.isfinite(a.hourly_cost) or a.hourly_cost<=0):p.error('hourly-cost must be positive and finite')
     if not math.isfinite(a.seconds):p.error('seconds must be finite')
     return a
