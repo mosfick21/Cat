@@ -26,6 +26,7 @@ import time
 
 CONTRACT = '0x4272D6f51771839F596082eF48fa84D35239Bab3'
 DEFAULT_WS = 'wss://robinhood.drpc.org'
+POLL_NOTE = 1.5          # what the fallback poll costs, for the watcher's message
 CHAIN_ID = 4663
 MAX_SUPPLY = 4444
 EXPLORER = 'https://robinhoodchain.blockscout.com/tx/'
@@ -220,22 +221,34 @@ def follow_mints(url, wake, stop):
         return
     subscribe = json.dumps(dict(jsonrpc='2.0', id=1, method='eth_subscribe',
                                 params=['logs', {'address': CONTRACT}]))
+    failures, heard = 0, 0
     while not stop.is_set():
         try:
             with connect(url, open_timeout=10, close_timeout=2) as socket:
                 socket.send(subscribe)
-                socket.recv(timeout=10)          # the subscription id
-                wake.set()                       # re-read now that we are live
+                answer = socket.recv(timeout=10)          # the subscription id
+                if 'result' not in answer:
+                    raise RuntimeError(answer[:120])
+                log(f'mint watch live on {url}' + (f' (after {failures} failures)' if failures else ''))
+                failures = 0
+                wake.set()                                # re-read now that we are live
                 while not stop.is_set():
                     try:
                         socket.recv(timeout=30)
                     except TimeoutError:
                         socket.ping()
                         continue
+                    heard += 1
                     wake.set()
-        except Exception:
+        except Exception as exc:
             if stop.is_set():
                 return
+            failures += 1
+            # Say it once, then once a minute: a silent watcher looks exactly
+            # like a working one, and the run has no way to tell.
+            if failures == 1 or failures % 30 == 0:
+                log(f'mint watch cannot reach {url} ({type(exc).__name__}: {str(exc)[:90]});'
+                    f' polling every {POLL_NOTE}s meanwhile')
             time.sleep(2)
 
 
@@ -410,7 +423,6 @@ def main():
         watching = threading.Thread(target=follow_mints, daemon=True,
                                     args=(args.ws, wake, stop))
         watching.start()
-        log('watching mints over ' + args.ws)
 
     rates, ready = {}, set()
     mined, lost, pending = 0, 0, []
