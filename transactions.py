@@ -221,7 +221,26 @@ class TxManager:
         log(f'Mint price: {Web3.from_wei(price, "ether")} ETH; gas limit: {tx["gas"]}')
         self.sign_and_record(tx)
 
+    # An endpoint that serves reads perfectly can still refuse this: one of
+    # the public endpoints allows no more than three calls in a batch, and
+    # this sends eight or nine. Rotating onto it used to make every submit
+    # fail with nothing to say, so preflight walks the endpoints instead and
+    # keeps the one that answered.
     def preflight(self, simulate=None):
+        order = list(dict.fromkeys([getattr(self, 'preflight_url', None) or
+                                    self.w.provider.endpoint_uri] + list(self.urls)))
+        refusals = []
+        for url in order:
+            try:
+                state = self.preflight_at(url, simulate)
+            except Exception as exc:
+                refusals.append(f'{url.split("//")[-1].split("/")[0]}: {str(exc)[:80]}')
+                continue
+            self.preflight_url = url
+            return state
+        raise RuntimeError('Transaction preflight failed at every endpoint: ' + '; '.join(refusals))
+
+    def preflight_at(self, url, simulate=None):
         import requests
         funcs=[('prev','prevWork',[]),('target','targetFor',[self.account.address]),('price','mintPrice',[])]
         calls=[dict(jsonrpc='2.0',id=i,method='eth_call',params=[{'to':ADDRESS,'data':getattr(self.c.functions,name)(*args)._encode_transaction_data()},'latest']) for i,(_,name,args) in enumerate(funcs)]
@@ -238,7 +257,7 @@ class TxManager:
             calls.append(dict(jsonrpc='2.0',id=8,method='eth_call',
                               params=[{'to':ADDRESS,'from':self.account.address,
                                        'data':data,'value':hex(value)},'latest']))
-        response=requests.post(self.w.provider.endpoint_uri,json=calls,timeout=(3,6))
+        response=requests.post(url,json=calls,timeout=(3,6))
         response.raise_for_status()
         rows=response.json()
         if not isinstance(rows,list) or len(rows)!=len(calls):raise RuntimeError('Incomplete transaction preflight')

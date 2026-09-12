@@ -294,6 +294,48 @@ class TransactionTests(unittest.TestCase):
         released.set()
         self.assertLess(elapsed,1,'broadcast waited for the slower endpoints')
 
+    def preflighter(self,limit=None,broken=()):
+        """A manager whose first endpoint refuses batches larger than `limit`."""
+        m=object.__new__(TxManager)
+        m.args=NS(confirmations=3,max_cost_eth=None)
+        m.account=NS(address=WALLET)
+        m.urls=['http://limited','http://good']
+        m.w=NS(provider=NS(endpoint_uri='http://limited'))
+        encoded=NS(_encode_transaction_data=lambda:'0x00')
+        m.c=NS(functions=NS(prevWork=lambda:encoded,targetFor=lambda a:encoded,mintPrice=lambda:encoded))
+        asked=[]
+        class Reply:
+            def __init__(self,rows,status=200):self.rows,self.status=rows,status
+            def raise_for_status(self):
+                if self.status!=200:raise RuntimeError(f'HTTP {self.status}')
+            def json(self):return self.rows
+        def post(url,json=None,timeout=None):
+            asked.append((url,len(json)))
+            if url in broken:raise ConnectionError('refused')
+            if limit is not None and url=='http://limited' and len(json)>limit:
+                return Reply([{'id':0,'jsonrpc':'2.0','error':{'message':'Batch of more than 3 requests are not allowed'}}],500)
+            answers={0:5,1:1<<200,2:1000,3:4,4:4,5:7,6:core.CHAIN_ID,7:10**18}
+            return Reply([{'id':i,'result':hex(v)} for i,v in answers.items()])
+        return m,asked,NS(post=post)
+
+    def test_an_endpoint_that_refuses_the_batch_is_stepped_over(self):
+        m,asked,fake=self.preflighter(limit=3)
+        with patch.dict(sys.modules,{'requests':fake}):state=m.preflight()
+        self.assertEqual(state['prev'],5);self.assertEqual(state['nonce'],4)
+        self.assertEqual([url for url,_ in asked],['http://limited','http://good'])
+
+    def test_the_endpoint_that_answered_is_asked_first_next_time(self):
+        m,asked,fake=self.preflighter(limit=3)
+        with patch.dict(sys.modules,{'requests':fake}):
+            m.preflight();asked.clear();m.preflight()
+        self.assertEqual([url for url,_ in asked],['http://good'])
+
+    def test_preflight_says_which_endpoints_refused_when_all_do(self):
+        m,_,fake=self.preflighter(broken=('http://limited','http://good'))
+        with patch.dict(sys.modules,{'requests':fake}):
+            with self.assertRaises(RuntimeError) as caught:m.preflight()
+        self.assertIn('limited',str(caught.exception));self.assertIn('good',str(caught.exception))
+
     def test_journal_restart_and_exclusive_lock(self):
         with tempfile.TemporaryDirectory() as directory,patch.dict(ns,ROOT=Path(directory)):
             j=Journal(WALLET);j.data.update(status='pending',attempts=[dict(raw='0x12',hash='0x01')]);j.save()
