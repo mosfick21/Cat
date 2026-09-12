@@ -68,25 +68,34 @@ class Chain:
         raise last
 
     def state(self):
-        """Challenge, difficulty and supply in one request, so they agree."""
+        """Challenge, difficulty and supply in one request, so they agree.
+
+        The block number rides along because endpoints do not share a tip -
+        measured today, one was ten blocks (a second) behind the other. Reads
+        rotate for resilience, so without this the job would walk backwards
+        every other poll: a fresh challenge from one node, then the dead one
+        from the other, and a batch spent on a question already answered.
+        """
         names = ['challenge', 'difficulty', 'supply']
         calls = [dict(jsonrpc='2.0', id=i, method='eth_call',
                       params=[{'to': CONTRACT, 'data': SELECTOR[n]}, 'latest'])
                  for i, n in enumerate(names)]
+        calls.append(dict(jsonrpc='2.0', id=len(names), method='eth_blockNumber', params=[]))
         last = None
         for _ in range(len(self.urls)):
             url = self.urls[self.index % len(self.urls)]
             self.index += 1
             try:
                 rows = self.post(url, calls)
-                if not isinstance(rows, list) or len(rows) != 3:
+                if not isinstance(rows, list) or len(rows) != len(calls):
                     raise RuntimeError('incomplete state read')
                 rows.sort(key=lambda r: r['id'])
                 if any('error' in r for r in rows):
                     raise RuntimeError('state read refused')
                 return dict(challenge=rows[0]['result'],
                             difficulty=int(rows[1]['result'], 16),
-                            supply=int(rows[2]['result'], 16))
+                            supply=int(rows[2]['result'], 16),
+                            block=int(rows[3]['result'], 16), endpoint=url)
             except Exception as exc:
                 last = exc
         raise last
@@ -230,6 +239,21 @@ def follow_mints(url, wake, stop):
             time.sleep(2)
 
 
+def accept_state(fresh, seen_block):
+    """Take a state read only if it is not older than one already seen.
+
+    Endpoints do not share a tip - one was measured ten blocks behind the
+    other - and reads rotate, so an answer from the slower node is the past.
+    Acting on it walks the job backwards onto a challenge that is already
+    spent, and the batch that follows cannot win.
+    """
+    if fresh is None:
+        return None, seen_block
+    if fresh['block'] < seen_block:
+        return None, seen_block
+    return fresh, fresh['block']
+
+
 def preimage(address, nonce, challenge_hex):
     return (bytes.fromhex(address[2:]) + nonce.to_bytes(32, 'big')
             + bytes.fromhex(challenge_hex[2:]))
@@ -333,7 +357,7 @@ def main():
     chain = Chain(args.rpc or RPCS)
     state = chain.state()
     log(f'minted {state["supply"]}/{MAX_SUPPLY} | difficulty {state["difficulty"]} bits'
-        f' | {len(chain.urls)} endpoint')
+        f' | {len(chain.urls)} endpoint | block {state["block"]}')
     if state['supply'] >= MAX_SUPPLY:
         raise SystemExit('Sold out. Nothing left to mine.')
 
@@ -391,7 +415,7 @@ def main():
     rates, ready = {}, set()
     mined, lost, pending = 0, 0, []
     job, last_poll, last_print = None, 0., time.monotonic()
-    last_balance = 0.
+    last_balance, seen_block, behind = 0., 0, 0
     try:
         while True:
             now = time.monotonic()
@@ -437,6 +461,14 @@ def main():
                 if fresh and fresh['supply'] >= MAX_SUPPLY:
                     log(f'SOLD OUT at {fresh["supply"]}/{MAX_SUPPLY}. Stopping; mined {mined}, lost {lost}.')
                     return
+                stale = fresh if fresh and fresh['block'] < seen_block else None
+                fresh, seen_block = accept_state(fresh, seen_block)
+                if stale is not None:
+                    behind += 1
+                    if behind % 20 == 1:
+                        log(f'{stale["endpoint"].split("//")[-1].split("/")[0]} is'
+                            f' {seen_block - stale["block"]} blocks behind; ignoring its read')
+
                 if fresh and (job is None or fresh['challenge'] != job['challenge']
                               or fresh['difficulty'] != job['difficulty']):
                     if job is not None:

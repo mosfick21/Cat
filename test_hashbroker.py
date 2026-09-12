@@ -71,3 +71,47 @@ class SelectorTests(unittest.TestCase):
 
 if __name__ == '__main__':
     unittest.main()
+
+
+class EndpointTipTests(unittest.TestCase):
+    """Endpoints do not share a tip, and reads rotate between them."""
+
+    def read(self, block, challenge='0x' + 'aa' * 32):
+        return dict(block=block, challenge=challenge, difficulty=48, supply=100,
+                    endpoint='https://example.test/')
+
+    def test_a_newer_read_is_taken_and_remembered(self):
+        fresh, seen = hashbroker.accept_state(self.read(100), 0)
+        self.assertIsNotNone(fresh)
+        self.assertEqual(seen, 100)
+
+    def test_a_read_from_behind_the_tip_is_refused(self):
+        # Measured: one endpoint ran ten blocks behind the other. Taking its
+        # answer puts the miner back on a challenge that is already spent.
+        _, seen = hashbroker.accept_state(self.read(120), 0)
+        fresh, seen = hashbroker.accept_state(self.read(110, '0x' + 'bb' * 32), seen)
+        self.assertIsNone(fresh)
+        self.assertEqual(seen, 120, 'a stale read must not move the mark back')
+
+    def test_a_read_at_the_same_block_is_still_taken(self):
+        _, seen = hashbroker.accept_state(self.read(120), 0)
+        fresh, seen = hashbroker.accept_state(self.read(120), seen)
+        self.assertIsNotNone(fresh)
+        self.assertEqual(seen, 120)
+
+    def test_a_failed_read_changes_nothing(self):
+        _, seen = hashbroker.accept_state(self.read(120), 0)
+        fresh, seen = hashbroker.accept_state(None, seen)
+        self.assertIsNone(fresh)
+        self.assertEqual(seen, 120)
+
+    def test_alternating_endpoints_never_walk_the_job_backwards(self):
+        # Ten polls alternating a leading and a lagging node: the challenge
+        # the miner ends up on must never be an older one than it has seen.
+        seen, taken = 0, []
+        for i in range(10):
+            block = 1000 + i * 10 + (0 if i % 2 else 7)   # one node runs ahead
+            fresh, seen = hashbroker.accept_state(self.read(block, f'0x{block:064x}'), seen)
+            if fresh:
+                taken.append(fresh['block'])
+        self.assertEqual(taken, sorted(taken), 'the job walked backwards')
