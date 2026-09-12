@@ -187,3 +187,31 @@ once. `--once` stops after a single mint.
 
 Needs `cupy`, `numpy`, `requests` and `eth-account` (all pulled in by
 `requirements.txt`).
+
+## ZEROS (`zeros.py`)
+
+A third mint on the same chain, Keccak this time, and the easiest of them:
+free, 3,333 supply, no per-wallet limit, and a difficulty that started at
+2^24. The seed is fixed once revealed, so unlike Hash Broker nobody else's
+mint throws your work away — only the target moves.
+
+The proof is `keccak256(seed[32] ++ address[20] ++ nonce[32])` — 84 bytes, one
+Keccak block — and it wins when the digest read big-endian is below
+`2^256 / currentDifficulty()`. That layout is not documented; it was recovered
+by trying arrangements against free `mint(nonce)` transactions the contract
+accepted, and `test_zeros.py` keeps four of them as fixtures.
+
+The kernel patches the nonce straight into two lanes of the Keccak state.
+That arithmetic is checked in Python against the real padded block, so it can
+be proven right on a machine with no GPU — which is where getting it wrong
+would otherwise mean a miner that searches forever and finds nothing.
+
+```
+python3 zeros.py --self-test                   # compile, check against the CPU, exit
+export ZEROS_PRIVATE_KEY=0x...                 # or it asks at a hidden prompt
+python3 zeros.py --gpus all
+```
+
+It only ever calls the free `mint(uint256)`. The contract also sells tokens
+through `buy()`; this never touches it. It keeps going, one proof after the
+next, until the collection sells out or `--max-mints` is reached.
