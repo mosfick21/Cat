@@ -388,7 +388,8 @@ def main():
         watching.start()
         log('watching mints over ' + args.ws)
 
-    rates, ready, mined = {}, set(), 0
+    rates, ready = {}, set()
+    mined, lost, pending = 0, 0, []
     job, last_poll, last_print = None, 0., time.monotonic()
     try:
         while True:
@@ -401,8 +402,27 @@ def main():
                 except Exception as exc:
                     log(f'state read {type(exc).__name__}; keeping the last job')
                     fresh = None
+                for entry in list(pending):
+                    try:
+                        receipt = chain.call('eth_getTransactionReceipt', [entry['hash']])
+                    except Exception:
+                        continue
+                    if not receipt:
+                        if now - entry['sent'] > 120:
+                            pending.remove(entry)
+                            log(f'no receipt for {entry["hash"][:14]}... after two minutes; giving up on it')
+                        continue
+                    pending.remove(entry)
+                    if int(receipt['status'], 16) == 1:
+                        mined += 1
+                        log(f'CONFIRMED at {entry["bits"]} bits -> {EXPLORER}{entry["hash"]}')
+                    else:
+                        lost += 1
+                        log(f'lost the race: somebody else mined first and the challenge had'
+                            f' rotated -> {EXPLORER}{entry["hash"]}')
+
                 if fresh and fresh['supply'] >= MAX_SUPPLY:
-                    log(f'SOLD OUT at {fresh["supply"]}/{MAX_SUPPLY}. Stopping; mined {mined}.')
+                    log(f'SOLD OUT at {fresh["supply"]}/{MAX_SUPPLY}. Stopping; mined {mined}, lost {lost}.')
                     return
                 if fresh and (job is None or fresh['challenge'] != job['challenge']
                               or fresh['difficulty'] != job['difficulty']):
@@ -450,8 +470,9 @@ def main():
                         signed = account.sign_transaction(tx)
                         try:
                             chain.broadcast('0x' + signed.raw_transaction.hex())
-                            mined += 1
-                            log(f'MINED at {bits} bits -> {EXPLORER}0x{signed.hash.hex().lstrip("0x")}')
+                            sent = '0x' + signed.hash.hex().removeprefix('0x')
+                            pending.append(dict(hash=sent, bits=bits, sent=time.monotonic()))
+                            log(f'sent a {bits}-bit proof -> {EXPLORER}{sent}')
                         except Exception as exc:
                             log(f'broadcast failed: {exc}')
                             if 'fund' in str(exc).lower() or 'balance' in str(exc).lower():
@@ -461,7 +482,7 @@ def main():
                                 except Exception:
                                     pass
                         job, last_poll = None, 0.   # the challenge is about to change
-                        if args.once or (args.max_mints and mined >= args.max_mints):
+                        if args.once or (args.max_mints and mined + len(pending) >= args.max_mints):
                             log(f'Reached the mint limit. Stopping; mined {mined}.')
                             return
 
@@ -470,8 +491,9 @@ def main():
                 bits = job['difficulty'] if job else None
                 expect = f'{2 ** bits / total:.0f}s' if bits and total else '?'
                 each = ' '.join(f'gpu{d}:{rates[d]/1e6:.0f}' for d in sorted(rates))
+                tally = f'mined {mined}' + (f', lost {lost}' if lost else '')
                 log(f'{total/1e9:.2f} GH/s over {len(rates)}/{len(devices)} GPU [{each}]'
-                    f' | {bits or "?"} bits | one every ~{expect} | mined {mined}')
+                    f' | {bits or "?"} bits | one every ~{expect} | {tally}')
                 last_print = time.monotonic()
     finally:
         stop.set()
