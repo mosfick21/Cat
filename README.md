@@ -161,3 +161,29 @@ See `MINING_AUDIT.md` for the verified protocol observations and limits.
 The documented rules count recent mints for the network and for the mining address. The log's `wallet penalty` is measured as `currentTarget / targetFor(wallet)` at the same RPC snapshot; provisional log values are labelled while refreshing. If it is 1.00x, this snapshot shows no additional wallet-specific work compared with the network target. The documentation inspected does not establish a hard limit of three mints per address. Three-per-wallet behavior alone does not establish such a rule, hardware counts, or a target bypass.
 
 This release does not automatically create or fund wallets and does not remove the stop-after-one journal. A new wallet does not by itself remove the network's mining target. Real network targets and other wallets' mint histories were not accessible from this environment; the public mining page also remained at its Connecting state.
+
+## Hash Broker (`hashbroker.py`)
+
+A second proof of work on the same chain, and a separate miner: SHA-256
+instead of Keccak, a free mint, 4,444 supply, and no per-wallet limit — one
+address held 15 while this was written, so the miner keeps going after a win.
+
+The proof is `sha256(address[20] ++ nonce[32] ++ challenge[32])` — 84 bytes —
+and wins with at least `currentDifficulty()` leading zero bits. Nothing
+documents that layout; it was read out of the site's WebGPU shader and then
+checked against four mints that really landed. `test_hashbroker.py` holds
+those four as fixtures, so a single wrong byte fails the suite.
+
+```
+python3 hashbroker.py --self-test              # compile, check against hashlib, exit
+export HASHBROKER_PRIVATE_KEY=0x...            # or it asks at a hidden prompt
+python3 hashbroker.py --gpus all
+```
+
+The challenge changes the instant anybody mints, so a solution is worth
+nothing a second later: the job is re-read off the hashing path, each GPU
+launch is sized to `--batch-ms`, and a found nonce goes to every endpoint at
+once. `--once` stops after a single mint.
+
+Needs `cupy`, `numpy`, `requests` and `eth-account` (all pulled in by
+`requirements.txt`).
