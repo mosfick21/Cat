@@ -286,12 +286,18 @@ def main():
     parser.add_argument('--poll', type=float, default=1.5, help='seconds between challenge reads')
     parser.add_argument('--self-test', action='store_true', help='check the kernel and exit; no key asked')
     parser.add_argument('--once', action='store_true', help='stop after one successful mint')
+    parser.add_argument('--max-mints', type=int, default=0, help='stop after this many mints, 0 for no limit')
     args = parser.parse_args()
     os.umask(0o077)
 
+    if args.max_mints < 0:
+        raise SystemExit('--max-mints cannot be negative')
     chain = Chain(args.rpc or RPCS)
     state = chain.state()
-    log(f'minted {state["supply"]}/{MAX_SUPPLY} | difficulty {state["difficulty"]} bits')
+    log(f'minted {state["supply"]}/{MAX_SUPPLY} | difficulty {state["difficulty"]} bits'
+        f' | {len(chain.urls)} endpoint')
+    if state['supply'] >= MAX_SUPPLY:
+        raise SystemExit('Sold out. Nothing left to mine.')
 
     account = None
     if args.self_test:
@@ -348,6 +354,9 @@ def main():
                 except Exception as exc:
                     log(f'state read {type(exc).__name__}; keeping the last job')
                     fresh = None
+                if fresh and fresh['supply'] >= MAX_SUPPLY:
+                    log(f'SOLD OUT at {fresh["supply"]}/{MAX_SUPPLY}. Stopping; mined {mined}.')
+                    return
                 if fresh and (job is None or fresh['challenge'] != job['challenge']
                               or fresh['difficulty'] != job['difficulty']):
                     if job is not None:
@@ -398,16 +407,24 @@ def main():
                             log(f'MINED at {bits} bits -> {EXPLORER}0x{signed.hash.hex().lstrip("0x")}')
                         except Exception as exc:
                             log(f'broadcast failed: {exc}')
+                            if 'fund' in str(exc).lower() or 'balance' in str(exc).lower():
+                                try:
+                                    wei = int(chain.call('eth_getBalance', [address, 'latest']), 16)
+                                    log(f'wallet holds {wei / 1e18:.6f} ETH; fund it on Robinhood Chain')
+                                except Exception:
+                                    pass
                         job, last_poll = None, 0.   # the challenge is about to change
-                        if args.once:
+                        if args.once or (args.max_mints and mined >= args.max_mints):
+                            log(f'Reached the mint limit. Stopping; mined {mined}.')
                             return
 
             if time.monotonic() - last_print >= 10 and rates:
                 total = sum(rates.values())
                 bits = job['difficulty'] if job else None
                 expect = f'{2 ** bits / total:.0f}s' if bits and total else '?'
-                log(f'{total/1e6:.0f} MH/s over {len(rates)} GPU | {bits or "?"} bits'
-                    f' | one every ~{expect} | mined {mined}')
+                each = ' '.join(f'gpu{d}:{rates[d]/1e6:.0f}' for d in sorted(rates))
+                log(f'{total/1e9:.2f} GH/s over {len(rates)}/{len(devices)} GPU [{each}]'
+                    f' | {bits or "?"} bits | one every ~{expect} | mined {mined}')
                 last_print = time.monotonic()
     finally:
         stop.set()
