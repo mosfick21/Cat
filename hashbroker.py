@@ -204,7 +204,11 @@ def follow_mints(url, wake, stop):
     of forty seconds. This only ever asks for an earlier read; the poll stays
     as the fallback, so a dead socket costs nothing but that four percent.
     """
-    from websockets.sync.client import connect
+    try:
+        from websockets.sync.client import connect
+    except ImportError:
+        log('websockets is not installed; polling only (pip install websockets)')
+        return
     subscribe = json.dumps(dict(jsonrpc='2.0', id=1, method='eth_subscribe',
                                 params=['logs', {'address': CONTRACT}]))
     while not stop.is_set():
