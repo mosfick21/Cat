@@ -299,8 +299,8 @@ def worker(device, address, jobs, results, stop, options):
             elapsed = time.perf_counter() - began
             counted += batch
             if int(found.get()[0]):
-                results.put(dict(type='found', device=device,
-                                 nonce=int(result.get()[0]), challenge=job['challenge']))
+                results.put(dict(type='found', device=device, nonce=int(result.get()[0]),
+                                 challenge=job['challenge'], searched=job['difficulty']))
             now = time.monotonic()
             if now - reported >= 10:
                 results.put(dict(type='rate', device=device, hps=counted / (now - reported)))
@@ -391,6 +391,7 @@ def main():
     rates, ready = {}, set()
     mined, lost, pending = 0, 0, []
     job, last_poll, last_print = None, 0., time.monotonic()
+    last_balance = 0.
     try:
         while True:
             now = time.monotonic()
@@ -420,6 +421,18 @@ def main():
                         lost += 1
                         log(f'lost the race: somebody else mined first and the challenge had'
                             f' rotated -> {EXPLORER}{entry["hash"]}')
+
+                if fresh and account is not None and now - last_balance >= 60:
+                    last_balance = now
+                    try:
+                        wei = int(chain.call('eth_getBalance', [address, 'latest']), 16)
+                        price = int(int(chain.call('eth_gasPrice', []), 16) * 1.2) + 1
+                        left = wei // (MINT_GAS * price)
+                        if left < 10:
+                            log(f'gas is low: {wei / 1e18:.6f} ETH, about {left} more proofs'
+                                f' - fund {address} on Robinhood Chain')
+                    except Exception:
+                        pass
 
                 if fresh and fresh['supply'] >= MAX_SUPPLY:
                     log(f'SOLD OUT at {fresh["supply"]}/{MAX_SUPPLY}. Stopping; mined {mined}, lost {lost}.')
@@ -454,10 +467,18 @@ def main():
                 if kind == 'found':
                     digest = cpu_digest(address, message['nonce'], message['challenge'])
                     bits = leading_zeros(digest)
+                    if bits < message.get('searched', 0):
+                        # Fewer bits than the GPU was told to find is the one
+                        # thing that means the card is wrong, not the world.
+                        raise RuntimeError(f'GPU {message["device"]} returned a {bits}-bit nonce for'
+                                           f' a {message["searched"]}-bit search')
                     if job is None or message['challenge'] != job['challenge']:
                         log('solution arrived for an old challenge; dropped')
                     elif bits < job['difficulty']:
-                        raise RuntimeError('GPU candidate failed CPU verification')
+                        # The bar moved between the launch and the answer.
+                        # Not the card's fault and not worth a transaction.
+                        log(f'difficulty rose to {job["difficulty"]} while a {bits}-bit nonce'
+                            f' was in flight; dropped')
                     elif args.self_test:
                         log(f'self-test solution at {bits} bits; nothing sent')
                     else:
