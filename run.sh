@@ -3,7 +3,6 @@ set -euo pipefail
 cd -- "$(dirname -- "${BASH_SOURCE[0]}")"
 # These read-only/offline paths need only Python's standard library and g++ for CPU.
 cpu_mode=0
-modal_mode=0
 offline_mode=0
 network_mode=0
 previous=''
@@ -12,7 +11,6 @@ for argument in "$@"; do
   if [[ "$argument" == '--inspect' ]]; then cpu_mode=1; fi
   if [[ "$argument" == '--network-test' ]]; then network_mode=1; fi
   if [[ "$argument" == '--backend=cpu' || ( "$previous" == '--backend' && "$argument" == 'cpu' ) ]]; then cpu_mode=1; fi
-  if [[ "$argument" == '--backend=modal' || ( "$previous" == '--backend' && "$argument" == 'modal' ) ]]; then modal_mode=1; fi
   if [[ "$argument" == '--benchmark' || "$argument" == '--self-test' ]]; then offline_mode=1; fi
   previous="$argument"
 done
@@ -41,11 +39,6 @@ install() { "$python" -m pip install "$@" || { echo "Dependency installation fai
 if (( network_mode )); then
   if ! "$python" -c 'import requests; from websockets.sync.client import connect' >/dev/null 2>&1; then
     install 'requests>=2.32,<3' 'websockets>=15,<16'
-  fi
-elif (( modal_mode )); then
-  # The GPUs are rented, so nothing CUDA is installed here - only the client.
-  if ! "$python" -c 'import modal, web3, requests; from websockets.sync.client import connect' >/dev/null 2>&1; then
-    install 'modal>=1.0,<2' 'web3>=7.13,<8' 'websockets>=15,<16'
   fi
 elif (( cpu_mode )); then
   if ! "$python" -c 'import web3, requests; from websockets.sync.client import connect' >/dev/null 2>&1; then
