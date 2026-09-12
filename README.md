@@ -161,3 +161,18 @@ See `MINING_AUDIT.md` for the verified protocol observations and limits.
 The documented rules count recent mints for the network and for the mining address. The log's `wallet penalty` is measured as `currentTarget / targetFor(wallet)` at the same RPC snapshot; provisional log values are labelled while refreshing. If it is 1.00x, this snapshot shows no additional wallet-specific work compared with the network target. The documentation inspected does not establish a hard limit of three mints per address. Three-per-wallet behavior alone does not establish such a rule, hardware counts, or a target bypass.
 
 This release does not automatically create or fund wallets and does not remove the stop-after-one journal. A new wallet does not by itself remove the network's mining target. Real network targets and other wallets' mint histories were not accessible from this environment; the public mining page also remained at its Connecting state.
+
+## Renting the GPUs (Modal)
+
+The key, the RPC endpoints and the signing stay on your own machine; only the
+address, the previous work, the anchor and a target cross to a rented GPU, and
+only nonces come back.
+
+```
+modal token new                      # once
+export HASHCATS_MODAL_GPU=L40S       # or H100, B200, "RTX PRO 6000"
+./run.sh --backend modal --modal-gpus 10 --rpc <your-rpc> --max-cost-eth 0.12
+```
+
+`--benchmark` measures local hardware and is refused with this backend; run it
+on the rented GPU itself to learn its real rate.

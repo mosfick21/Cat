@@ -26,7 +26,8 @@ def args_parser():
     p.add_argument('--benchmark',action='store_true',help='No wallet/RPC/transactions; compare old and selected kernels')
     p.add_argument('--self-test',action='store_true',help='Compile, validate and tune selected workers, then exit without a wallet')
     p.add_argument('--seconds',type=float,default=15,help='Benchmark seconds per kernel, baseline then selected')
-    p.add_argument('--backend',choices=('cuda','cpu','hybrid'),default='cuda',help='CUDA GPUs, native CPU, or both')
+    p.add_argument('--backend',choices=('cuda','cpu','hybrid','modal'),default='cuda',help='CUDA GPUs, native CPU, both, or rented Modal GPUs')
+    p.add_argument('--modal-gpus',type=int,default=10,help='Rented GPUs to run with --backend modal')
     p.add_argument('--cpu-threads',type=int,default=0,help='0 reserves some CPU capacity for RPC/signing; otherwise explicit thread count')
     p.add_argument('--hourly-cost',type=float,help='Total instance rental cost per hour, for synthetic hashes per dollar comparison')
     p.add_argument('--audit-mints',action='store_true',help='Read recent Mined events: actual target, wallet repeats and mint intervals; no key/GPU')
@@ -56,6 +57,8 @@ def args_parser():
         if not value.is_finite() or value<=0:p.error('max-cost-eth must be positive and finite')
     if a.inspect and not a.address:p.error('--inspect requires --address (public address only)')
     if a.cpu_threads<0 or not 1<=a.audit_blocks<=100000:p.error('cpu-threads >= 0 and audit-blocks 1..100000 required')
+    if not 1<=a.modal_gpus<=50:p.error('modal-gpus 1..50 required')
+    if a.backend=='modal' and a.benchmark:p.error('--benchmark measures local hardware; run it on the rented GPU itself')
     if a.hourly_cost is not None and (not math.isfinite(a.hourly_cost) or a.hourly_cost<=0):p.error('hourly-cost must be positive and finite')
     if not math.isfinite(a.seconds):p.error('seconds must be finite')
     return a
@@ -63,6 +66,8 @@ def args_parser():
 
 def devices_for(args):
     if args.backend=='cpu':return ['cpu']
+    # Rented GPUs are not visible here, so nothing local is enumerated.
+    if args.backend=='modal':return [f'modal-{i}' for i in range(args.modal_gpus)]
     import cupy as cp
     count=cp.cuda.runtime.getDeviceCount()
     if not count:raise RuntimeError('No visible NVIDIA CUDA GPU')
@@ -288,7 +293,12 @@ def main():
     log('Selected workers: '+','.join(map(str,devices)))
     options=dict(benchmark=args.benchmark,seconds=args.seconds,retune=args.retune,
                  batch_ms=args.batch_ms,cpu_threads=args.cpu_threads)
-    farm=Farm(devices,options);farm.benchmark_seconds=args.seconds;farm.start()
+    if args.backend=='modal':
+        from modal_farm import ModalFarm
+        farm=ModalFarm(len(devices),options)
+    else:
+        farm=Farm(devices,options)
+    farm.benchmark_seconds=args.seconds;farm.start()
     try:
         wait_for_gpus(farm,args.benchmark,args.hourly_cost,args.backend)
         if args.benchmark or args.self_test:return
