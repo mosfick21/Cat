@@ -25,6 +25,7 @@ import sys
 import time
 
 CONTRACT = '0x4272D6f51771839F596082eF48fa84D35239Bab3'
+DEFAULT_WS = 'wss://robinhood.drpc.org'
 CHAIN_ID = 4663
 MAX_SUPPLY = 4444
 EXPLORER = 'https://robinhoodchain.blockscout.com/tx/'
@@ -194,6 +195,37 @@ extern "C" __global__ void search(const unsigned int* base, unsigned long long s
 '''
 
 
+def follow_mints(url, wake, stop):
+    """Wake the coordinator the instant anybody mints.
+
+    Polling alone means learning about a new challenge up to one poll late,
+    and every millisecond of that is spent hashing a round that is already
+    over - about four percent of the card at a poll of 1.5 s against rounds
+    of forty seconds. This only ever asks for an earlier read; the poll stays
+    as the fallback, so a dead socket costs nothing but that four percent.
+    """
+    from websockets.sync.client import connect
+    subscribe = json.dumps(dict(jsonrpc='2.0', id=1, method='eth_subscribe',
+                                params=['logs', {'address': CONTRACT}]))
+    while not stop.is_set():
+        try:
+            with connect(url, open_timeout=10, close_timeout=2) as socket:
+                socket.send(subscribe)
+                socket.recv(timeout=10)          # the subscription id
+                wake.set()                       # re-read now that we are live
+                while not stop.is_set():
+                    try:
+                        socket.recv(timeout=30)
+                    except TimeoutError:
+                        socket.ping()
+                        continue
+                    wake.set()
+        except Exception:
+            if stop.is_set():
+                return
+            time.sleep(2)
+
+
 def preimage(address, nonce, challenge_hex):
     return (bytes.fromhex(address[2:]) + nonce.to_bytes(32, 'big')
             + bytes.fromhex(challenge_hex[2:]))
@@ -284,6 +316,8 @@ def main():
     parser.add_argument('--batch-ms', type=float, default=250, help='target GPU launch duration')
     parser.add_argument('--blocks', type=int, default=4096, help='thread blocks per launch')
     parser.add_argument('--poll', type=float, default=1.5, help='seconds between challenge reads')
+    parser.add_argument('--ws', default=DEFAULT_WS, help='WebSocket that reports mints immediately')
+    parser.add_argument('--no-ws', action='store_true', help='poll only')
     parser.add_argument('--self-test', action='store_true', help='check the kernel and exit; no key asked')
     parser.add_argument('--once', action='store_true', help='stop after one successful mint')
     parser.add_argument('--max-mints', type=int, default=0, help='stop after this many mints, 0 for no limit')
@@ -342,12 +376,21 @@ def main():
             try: q.put_nowait(job)
             except Exception: pass
 
+    import threading
+    wake, watching = threading.Event(), None
+    if not args.no_ws:
+        watching = threading.Thread(target=follow_mints, daemon=True,
+                                    args=(args.ws, wake, stop))
+        watching.start()
+        log('watching mints over ' + args.ws)
+
     rates, ready, mined = {}, set(), 0
     job, last_poll, last_print = None, 0., time.monotonic()
     try:
         while True:
             now = time.monotonic()
-            if now - last_poll >= args.poll:
+            if now - last_poll >= args.poll or wake.is_set():
+                wake.clear()
                 last_poll = now
                 try:
                     fresh = chain.state()
