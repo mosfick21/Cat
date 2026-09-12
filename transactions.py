@@ -63,6 +63,47 @@ class TxManager:
         if not w.eth.get_code(ADDRESS):
             raise RuntimeError('Collection contract missing')
         self.w, self.c = w, c
+        self.urls = list(dict.fromkeys(urls))
+
+    # Arrival time is the whole ordering on this chain and a solution lives
+    # about ten seconds, so one endpoint answering slowly is enough to lose
+    # one - 863 ms was measured against a normal 55. The same signed bytes go
+    # to every endpoint at once and the first acknowledgement ends the wait.
+    # A duplicate is answered "already known": the nonce, the destination and
+    # the bytes are fixed, so a second arrival can never become a second mint.
+    def broadcast(self, raw):
+        import requests
+        from concurrent.futures import ThreadPoolExecutor, as_completed
+        payload = dict(jsonrpc='2.0', id=1, method='eth_sendRawTransaction',
+                       params=[Web3.to_hex(raw)])
+
+        def send(url):
+            try:
+                answer = requests.post(url, json=payload, timeout=(3, 6)).json()
+            except Exception as exc:
+                return exc
+            error = answer.get('error') if isinstance(answer, dict) else None
+            if not error:
+                return None
+            message = str(error.get('message', error) if isinstance(error, dict) else error)
+            if 'known' in message.lower() or 'exists' in message.lower():
+                return None  # The node is already holding it. That is delivery.
+            return RuntimeError(message)
+
+        pool = ThreadPoolExecutor(max_workers=len(self.urls))
+        try:
+            futures = [pool.submit(send, url) for url in self.urls]
+            failure = None
+            for future in as_completed(futures):
+                outcome = future.result()
+                if outcome is None:
+                    return
+                failure = failure or outcome
+            raise failure
+        finally:
+            # Never wait on the slower endpoints: they are already sending,
+            # and holding the loop here is the delay this exists to remove.
+            pool.shutdown(wait=False)
 
     def sign_and_record(self, tx):
         signed = self.account.sign_transaction(tx)
@@ -75,7 +116,7 @@ class TxManager:
         data['attempts'].append({'hash': tx_hash, 'raw': raw})
         self.journal.save()  # MUST happen before broadcasting.
         log('Submitting mint: ' + EXPLORER + tx_hash)
-        self.w.eth.send_raw_transaction(signed.raw_transaction)
+        self.broadcast(signed.raw_transaction)
 
     def pending(self):
         data = self.journal.data
@@ -118,7 +159,7 @@ class TxManager:
                 return False
         # Rebroadcast identical bytes: its hash and nonce cannot create another mint.
         try:
-            self.w.eth.send_raw_transaction(bytes.fromhex(data['attempts'][-1]['raw'][2:]))
+            self.broadcast(bytes.fromhex(data['attempts'][-1]['raw'][2:]))
         except Exception:
             pass
         log('Waiting for mint confirmation...')

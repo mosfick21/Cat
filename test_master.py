@@ -195,7 +195,8 @@ class TransactionTests(unittest.TestCase):
         m.journal=NS(data=dict(status='pending',tx={'nonce':3},updated=time.time(),attempts=[{'hash':'0x01','raw':'0x12'}]),save=Mock())
         receipt=NS(status=status,blockNumber=8,blockHash=b'block')
         m.w=NS(eth=NS(get_transaction_receipt=Mock(return_value=receipt),block_number=10,
-                      get_block=Mock(return_value=NS(hash=b'block')),get_transaction_count=Mock(return_value=3),send_raw_transaction=Mock()))
+                      get_block=Mock(return_value=NS(hash=b'block')),get_transaction_count=Mock(return_value=3)))
+        m.urls=['http://one','http://two'];m.broadcast=Mock()
         event=NS(address=core.COLLECTION,args=NS(miner=WALLET,tokenId=42))
         m.c=NS(events=NS(Mined=lambda:NS(process_receipt=lambda *a,**k:[event] if events is None else events)))
         return m
@@ -216,14 +217,14 @@ class TransactionTests(unittest.TestCase):
     def test_revert_resumes_and_uncertain_send_rebroadcasts_same_bytes(self):
         m=self.manager(status=0);self.assertFalse(m.pending());self.assertEqual(m.journal.data['status'],'mining')
         m=self.manager();m.w.eth.get_transaction_receipt.side_effect=NotFound()
-        self.assertFalse(m.pending());m.w.eth.send_raw_transaction.assert_called_once_with(b'\x12')
+        self.assertFalse(m.pending());m.broadcast.assert_called_once_with(b'\x12')
 
     def test_disk_failure_prevents_broadcast(self):
         m=self.manager();m.journal.data['status']='mining'
         m.account=NS(sign_transaction=Mock(return_value=NS(raw_transaction=b'abc',hash=b'hash')))
         m.journal.save.side_effect=OSError('disk')
         with self.assertRaises(OSError):m.sign_and_record({'nonce':3})
-        m.w.eth.send_raw_transaction.assert_not_called()
+        m.broadcast.assert_not_called()
 
     def test_replacement_keeps_destination_value_data_and_nonce(self):
         m=self.manager();m.w.eth.get_transaction_receipt.side_effect=NotFound()
@@ -239,6 +240,59 @@ class TransactionTests(unittest.TestCase):
         receipt=m.w.eth.get_transaction_receipt.return_value
         m.w.eth.get_transaction_receipt.side_effect=[NotFound(),receipt]
         self.assertTrue(m.pending());self.assertEqual(m.journal.data['confirmed_hash'],'0x01')
+
+    def broadcaster(self,answers):
+        """The real broadcast, against endpoints that answer as given."""
+        m=object.__new__(TxManager);m.urls=['http://one','http://two','http://three']
+        seen=[]
+        class Reply:
+            def __init__(self,body):self.body=body
+            def json(self):return self.body
+        def post(url,json=None,timeout=None):
+            seen.append((url,json['method'],json['params'][0]))
+            answer=answers[url]
+            if isinstance(answer,Exception):raise answer
+            if callable(answer):answer=answer()
+            return Reply(answer)
+        return m,seen,NS(post=post)
+
+    def test_one_acknowledgement_is_enough_and_all_endpoints_get_it(self):
+        m,seen,fake=self.broadcaster({
+            'http://one':ConnectionError('refused'),
+            'http://two':{'result':'0xhash'},
+            'http://three':{'error':{'message':'already known'}}})
+        with patch.dict(sys.modules,{'requests':fake}):m.broadcast(b'\x12\x34')
+        self.assertEqual({url for url,_,_ in seen},set(m.urls))
+        self.assertEqual({method for _,method,_ in seen},{'eth_sendRawTransaction'})
+        self.assertEqual({raw for _,_,raw in seen},{'0x1234'})
+
+    def test_already_known_counts_as_delivered(self):
+        m,_,fake=self.broadcaster({
+            'http://one':{'error':{'message':'ALREADY KNOWN'}},
+            'http://two':{'error':{'message':'already exists'}},
+            'http://three':ConnectionError('refused')})
+        with patch.dict(sys.modules,{'requests':fake}):m.broadcast(b'\x12')
+
+    def test_every_endpoint_refusing_raises(self):
+        m,_,fake=self.broadcaster({
+            'http://one':ConnectionError('refused'),
+            'http://two':{'error':{'message':'insufficient funds'}},
+            'http://three':{'error':{'message':'nonce too low'}}})
+        with patch.dict(sys.modules,{'requests':fake}):
+            with self.assertRaises(Exception):m.broadcast(b'\x12')
+
+    def test_a_slow_endpoint_does_not_hold_the_broadcast(self):
+        released=threading.Event()
+        def slow():
+            released.wait(5)
+            return {'result':'0xhash'}
+        m,_,fake=self.broadcaster({
+            'http://one':slow,'http://two':slow,'http://three':{'result':'0xhash'}})
+        began=time.monotonic()
+        with patch.dict(sys.modules,{'requests':fake}):m.broadcast(b'\x12')
+        elapsed=time.monotonic()-began
+        released.set()
+        self.assertLess(elapsed,1,'broadcast waited for the slower endpoints')
 
     def test_journal_restart_and_exclusive_lock(self):
         with tempfile.TemporaryDirectory() as directory,patch.dict(ns,ROOT=Path(directory)):
