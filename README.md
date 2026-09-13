@@ -215,3 +215,37 @@ python3 zeros.py --gpus all
 It only ever calls the free `mint(uint256)`. The contract also sells tokens
 through `buy()`; this never touches it. It keeps going, one proof after the
 next, until the collection sells out or `--max-mints` is reached.
+
+## prspct (`prspct.py`)
+
+A fourth one, Robinhood Chain again, 8,888 shares. A share is paid for in
+sweat, in coin, or in any mix of the two: pay none of the price and the
+target is the full proof of work, pay all of it and there is no proof at all.
+This miner only ever takes the free end — `claim(nonce)` with value 0 — so
+the wallet spends gas and nothing else.
+
+The proof is the same 84 byte shape as ZEROS, `keccak256(seed ++ address ++
+nonce)`, and the seed is likewise fixed at open, so a nonce dug today is
+still good tomorrow. What moves is the target: work starts at 2^22 and
+doubles every 256 shares dug, which makes being early worth far more than
+being fast. The site publishes the curve in JavaScript and the contract's
+own reading of it was checked against `state()` at depth 937.
+
+Nothing here is trusted until it has been proven twice. `--self-test` hashes
+three claims the chain really accepted, checks the price and target curves
+against the contract's own numbers, and then rehashes on the CPU every hash
+the GPU kernel reports. A kernel whose digests all came back zero — every one
+of them "below" any target — was caught exactly there.
+
+```
+python3 prspct.py self-test                    # compile, verify, exit
+export PRSPCT_KEY=0x...                        # or it asks at a hidden prompt
+python3 prspct.py auto --margin 192
+```
+
+A hash is dug for a depth a little ahead of the live one, because other
+people mint while you dig; `--margin` is how far ahead, it doubles whenever a
+claim reverts and comes back down after three clean mints. `prspct.py mine
+--address 0x...` digs nonces on a machine that never sees a key, to be sent
+from elsewhere. `prspct_cell.py` is the same program as one paste-and-run
+Kaggle cell.
