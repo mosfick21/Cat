@@ -10,6 +10,7 @@ from collections import deque
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from decimal import Decimal
 
+import cupy as cp
 from eth_account import Account
 from rich.console import Console, Group
 from rich.live import Live
@@ -100,7 +101,7 @@ class UI:
         self.wallet, self.gpu, self.live = wallet, gpu, None
         self.logs = deque(maxlen=7)
         self.data = dict(phase="STARTING", minted=0, epoch=0, price=0, token_balance=0,
-                         rate=0.0, hashes=0, batch=0.0, target=0, best="-", tx="-")
+                         rate=0.0, hashes=0, batch=0.0, target=0, eta=None, best="-", tx="-")
 
     @staticmethod
     def short(value): return value if len(value) < 36 else value[:18] + "..." + value[-12:]
@@ -120,7 +121,13 @@ class UI:
         mine = Table.grid(expand=True); mine.add_column(style="bright_green", width=13); mine.add_column()
         rate = d["rate"]; speed = f"{rate/1e9:.2f} GH/s" if rate >= 1e9 else f"{rate/1e6:.2f} MH/s"
         mine.add_row("HASHRATE", speed); mine.add_row("HASHES", f"{d['hashes']:,}")
-        mine.add_row("GPU BATCH", f"{d['batch']:.0f} ms"); mine.add_row("EPOCH", str(d["epoch"]))
+        eta = d["eta"]
+        if eta is None: eta_text = "-"
+        elif eta < 60: eta_text = f"~{eta:.0f} sec average"
+        elif eta < 3600: eta_text = f"~{eta/60:.1f} min average"
+        else: eta_text = f"~{eta/3600:.1f} hr average"
+        mine.add_row("AVG ETA", eta_text); mine.add_row("GPU BATCH", f"{d['batch']:.0f} ms")
+        mine.add_row("EPOCH", str(d["epoch"]))
         mine.add_row("TARGET", f"0x{d['target']:064x}" if d["target"] else "-"); mine.add_row("BEST HASH", self.short(d["best"])); mine.add_row("LAST TX", self.short(d["tx"]))
         lines = [Text(x, style=c) for x, c in self.logs] or [Text("Starting...", style="dim")]
         return Group(Panel(top, title="FRONTRUNNERS GPU AUTO-MINER", border_style="bright_cyan"), Panel(mine, title="LIVE MINING", border_style="bright_green"), Panel(Group(*lines), title="ACTIVITY", border_style="blue"), Text(" Ctrl+C: stop safely | key is memory-only ", style="bold black on bright_cyan"))
@@ -149,8 +156,10 @@ def main():
     token = web3.eth.contract(address=TOKEN, abi=TOKEN_ABI)
     if not web3.eth.get_code(COLLECTION) or not web3.eth.get_code(TOKEN): raise RuntimeError("Contract code missing")
     if token.functions.decimals().call() != 18: raise RuntimeError("Unexpected FRONTRUN decimals")
-    driver = Driver(0)
-    ui = UI(account.address, driver.name)
+    device_count = int(cp.cuda.runtime.getDeviceCount())
+    if device_count < 1: raise RuntimeError("No CUDA GPU detected")
+    drivers = [Driver(i) for i in range(device_count)]
+    ui = UI(account.address, " + ".join(f"#{i+1} {d.name}" for i, d in enumerate(drivers)))
     ui.live = Live(ui.render(), console=console, refresh_per_second=5)
 
     def tx_send(fn, label):
@@ -182,11 +191,17 @@ def main():
 
     with ui.live:
         ui.log("RPC ready | " + " | ".join(f"#{i+1} {ms:.0f}ms" for i, (_, ms) in enumerate(warm)), "green")
-        config, _ = driver.tune(False, lambda message: ui.log(message, "yellow"))
-        ui.log(f"GPU tuned | {config['kernel']} | {config['threads']} threads", "green")
-        prefix = make_prefix(secrets.randbits(176), 0)
-        counter = secrets.randbits(48)
-        batch_count = 1 << 20
+        configs = []
+        for i, driver in enumerate(drivers):
+            with cp.cuda.Device(i):
+                config, _ = driver.tune(False, lambda message, i=i: ui.log(f"GPU #{i+1}: {message}", "yellow"))
+            configs.append(config)
+            ui.log(f"GPU #{i+1} tuned | {config['kernel']} | {config['threads']} threads", "green")
+        root = secrets.randbits(176)
+        prefixes = [make_prefix(root, i) for i in range(device_count)]
+        counters = [secrets.randbits(48) for _ in range(device_count)]
+        batch_counts = [1 << 20 for _ in range(device_count)]
+        gpu_pool = ThreadPoolExecutor(max_workers=device_count)
         successful = 0
         while mint_limit == 0 or successful < mint_limit:
             if not collection.functions.mintIsOpen().call():
@@ -204,18 +219,30 @@ def main():
             total_hashes = 0; rate = 0.0; last_poll = 0.0; found = None
             ui.update(phase="MINING")
             while found is None:
-                candidates, gpu_seconds, wall = driver.batch(gpu_job, prefix, counter, batch_count, config)
-                rate_now = batch_count / max(wall, .001); rate = rate_now if not rate else rate*.7 + rate_now*.3
-                total_hashes += batch_count; counter = (counter + batch_count) & ((1<<64)-1)
-                batch_count = max(1<<17, min(1<<28, int(batch_count * min(1.7, max(.6, TARGET_BATCH_SECONDS/max(wall,.001))))))
+                def run_batch(i):
+                    with cp.cuda.Device(i):
+                        return drivers[i].batch(gpu_job, prefixes[i], counters[i], batch_counts[i], configs[i])
+                began = time.perf_counter()
+                results = [future.result() for future in [gpu_pool.submit(run_batch, i) for i in range(device_count)]]
+                wall_all = max(time.perf_counter() - began, .001)
+                round_hashes = sum(batch_counts)
+                rate_now = round_hashes / wall_all; rate = rate_now if not rate else rate*.7 + rate_now*.3
+                total_hashes += round_hashes
+                all_candidates = []
+                for i, (candidates, gpu_seconds, wall) in enumerate(results):
+                    all_candidates.extend((i, nonce) for nonce in candidates)
+                    counters[i] = (counters[i] + batch_counts[i]) & ((1<<64)-1)
+                    batch_counts[i] = max(1<<17, min(1<<28, int(batch_counts[i] * min(1.7, max(.6, TARGET_BATCH_SECONDS/max(wall,.001))))))
                 best = "-"
-                if candidates:
-                    candidates.sort(key=lambda n: work(account.address, (prefix<<64)|n, gpu_job["prev"], gpu_job["anchor"]))
-                    nonce = (prefix << 64) | candidates[0]
+                if all_candidates:
+                    all_candidates.sort(key=lambda item: work(account.address, (prefixes[item[0]]<<64)|item[1], gpu_job["prev"], gpu_job["anchor"]))
+                    device, low_nonce = all_candidates[0]
+                    nonce = (prefixes[device] << 64) | low_nonce
                     value = work(account.address, nonce, gpu_job["prev"], gpu_job["anchor"])
                     best = "0x" + value.to_bytes(32, "big").hex()
                     if value < job["target"]: found = nonce
-                ui.update(rate=rate, hashes=total_hashes, batch=wall*1000, best=best)
+                eta = ((1 << 256) / job["target"] / rate) if rate > 0 else None
+                ui.update(rate=rate, hashes=total_hashes, batch=wall_all*1000, eta=eta, best=best)
                 if time.monotonic() - last_poll >= POLL_SECONDS:
                     fresh = read_job(); last_poll = time.monotonic()
                     aged = fresh["anchor_block"] + 1 < job["anchor_block"] or fresh["anchor_block"] + 1 - job["anchor_block"] >= anchor_window - 1
