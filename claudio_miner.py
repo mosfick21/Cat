@@ -9,7 +9,7 @@ import sys
 import time
 from collections import deque
 from concurrent.futures import ThreadPoolExecutor, as_completed
-from decimal import Decimal, InvalidOperation
+from decimal import Decimal
 
 import cupy as cp
 import numpy as np
@@ -239,7 +239,7 @@ class UI:
         top.add_column(style="bold cyan", width=12); top.add_column(); top.add_column(style="bold cyan", width=12); top.add_column()
         top.add_row("NETWORK", f"{CHAIN_NAME} ({CHAIN_ID})", "PHASE", d["phase"])
         top.add_row("WALLET", self.short(self.wallet), "GPU", self.gpu)
-        top.add_row("CONTRACT", self.short(CONTRACT), "PRICE", f"{Decimal(d['price']) / Decimal(10**18):.6f} ETH")
+        top.add_row("CONTRACT", self.short(CONTRACT), "MODE", "STRICT FREE ONLY")
         top.add_row("VOUCHERS", f"{d['issued']:,} / {MAX_SUPPLY:,}", "REVEALED", f"{d['revealed']:,}")
         mine = Table.grid(expand=True)
         mine.add_column(style="bright_green", width=14); mine.add_column()
@@ -263,14 +263,6 @@ def main() -> None:
     account = Account.from_key(key)
     key = ""
     premium = getpass.getpass("PREMIUM HTTP RPC URL(S) (hidden, optional): ").strip()
-    try:
-        cap = Decimal(input("MAX VOUCHER PRICE ETH (0 = FREE only): ").strip() or "0")
-        if cap < 0:
-            raise ValueError
-    except (InvalidOperation, ValueError):
-        raise SystemExit("Invalid maximum price")
-    cap_wei = int(cap * Decimal(10**18))
-
     rpc = RpcPool(([u.strip() for u in premium.split(",")] if premium else []) + DEFAULT_RPCS)
     warm = rpc.warm()
     web3 = Web3(Web3.HTTPProvider(rpc.urls[0], request_kwargs={"timeout": 12}))
@@ -316,8 +308,9 @@ def main() -> None:
     with ui.live:
         ui.log("RPC ready | " + " | ".join(f"#{i+1} {ms:.0f}ms" for i, (_, ms) in enumerate(warm)), "green")
         gpu.self_test(bytes(seed), account.address)
-        ui.log("GPU Keccak self-test and auto-tune passed", "green")
+        ui.log("GPU Keccak self-test passed | strict 0-ETH lock", "green")
         starting_tokens = set(contract.functions.account(account.address).call()[2])
+        last_wait_price = None
         while True:
             overview = contract.functions.overview().call()
             issued, revealed, _, round_no, price, difficulty, mining_paused, mint_paused = overview[:8]
@@ -349,31 +342,40 @@ def main() -> None:
                     ui.log("Work accepted; waiting for next-round payment window", "yellow")
                     time.sleep(.5)
                     continue
-                live_price = contract.functions.mintPriceWei().call()
-                ui.update(phase="PAYMENT", price=live_price)
+                ui.update(phase="FREE VOUCHER", price=job_price)
                 if mint_paused:
                     ui.log("Voucher payments are paused", "yellow"); time.sleep(1); continue
-                if live_price > cap_wei:
-                    ui.log(f"PRICE GUARD: {Decimal(live_price)/Decimal(10**18):.6f} ETH exceeds {cap:.6f} ETH", "red")
-                    time.sleep(1); continue
-                fn = contract.functions.payVoucher(live_price)
-                transact(fn, "Pay voucher", live_price)
+                if int(job_price) != 0:
+                    raise RuntimeError("Existing work is paid; refusing to send ETH. Use a wallet without pending paid work")
+                fn = contract.functions.payVoucher(0)
+                transact(fn, "Claim FREE voucher", 0)
                 continue
             if issued >= MAX_SUPPLY:
                 raise RuntimeError("All 4,444 vouchers are reserved")
             if mining_paused:
                 ui.update(phase="PAUSED"); time.sleep(1); continue
+            if int(price) != 0:
+                ui.update(phase="WAITING FOR FREE", price=price)
+                if price != last_wait_price:
+                    ui.log(f"Paid phase {Decimal(price)/Decimal(10**18):.6f} ETH | waiting for price 0", "yellow")
+                    last_wait_price = price
+                time.sleep(.5)
+                continue
+            last_wait_price = None
             if issued == 0 and contract.functions.owner().call().lower() != account.address.lower():
                 ui.update(phase="WAITING OWNER"); time.sleep(1); continue
             if seed == bytes(32):
                 ui.update(phase="OPEN ROUND")
                 transact(contract.functions.openRound(), "Open round")
                 continue
-            ui.update(phase="MINING", hashes=0, best=0)
+            if int(target) <= 0:
+                raise RuntimeError("Contract returned an invalid target")
+            ui.update(phase="MINING FREE", hashes=0, best=0, price=0)
             snapshot = (int(round_no), bytes(seed), int(target))
             def stale():
                 current = contract.functions.job(account.address).call()
-                return (int(current[0]), bytes(current[1]), int(current[2])) != snapshot or int(current[4]) != 0
+                live = contract.functions.overview().call()
+                return (int(current[0]), bytes(current[1]), int(current[2])) != snapshot or int(current[4]) != 0 or int(live[4]) != 0
             nonce = gpu.mine(bytes(seed), account.address, int(target), stale, ui)
             if nonce is None:
                 ui.log("Round changed; switched to fresh work with 0 gas", "yellow")
@@ -382,7 +384,8 @@ def main() -> None:
             if int.from_bytes(proof, "big") > int(target):
                 raise RuntimeError("CPU proof verification failed")
             current = contract.functions.job(account.address).call()
-            if (int(current[0]), bytes(current[1]), int(current[2])) != snapshot:
+            live = contract.functions.overview().call()
+            if (int(current[0]), bytes(current[1]), int(current[2])) != snapshot or int(live[4]) != 0:
                 ui.log("Proof became stale before submission", "yellow")
                 continue
             if contract.functions.usedSolution(proof).call():
