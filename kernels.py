@@ -35,13 +35,21 @@ HD u64 join_lane(u32 e,u32 o){
 '''
 
 
-def scalar64(unroll=1):
+def scalar64(unroll=1, lanes=(5, 6)):
+    """Fully unrolled, one named register per lane - no arrays anywhere.
+
+    `lanes` is where the nonce's low 64 bits sit, which depends on what the
+    contract hashes: (5, 6) for a message that opens with a 20-byte address,
+    (9, 10) for one that opens with a 32-byte seed. Everything else is the
+    same Keccak.
+    """
+    hi, lo = lanes
     lines=['HD void scalar64(const u64* base,u64 nonce,u64* out){']
     lines += ['const u64 rc[24]={'+','.join(hex(x)+'ULL' for x in RC)+'};']
     lines += [f'u64 s{i}='+ (f'base[{i}];' if i<17 else '0;') for i in range(25)]
     lines += ['u64 n=bswap(nonce);',
-              's5=(s5&0xffffffffULL)|(n<<32);',
-              's6=(s6&0xffffffff00000000ULL)|(n>>32);',
+              f's{hi}=(s{hi}&0xffffffffULL)|(n<<32);',
+              f's{lo}=(s{lo}&0xffffffff00000000ULL)|(n>>32);',
               f'#pragma unroll {unroll}', 'for(int r=0;r<24;r++){']
     for x in range(5):
         lines += [f'u64 c{x}='+'^'.join(f's{x+5*y}' for y in range(5))+';']
@@ -114,7 +122,7 @@ extern "C" __global__ void search_{name}(const {word}* base,const u64* target,u6
 '''
 
 
-def source(kind='scalar64', unroll=1):
-    if kind=='scalar64':return PRELUDE+scalar64(unroll)+wrapper(kind,'u64')
+def source(kind='scalar64', unroll=1, lanes=(5, 6)):
+    if kind=='scalar64':return PRELUDE+scalar64(unroll, lanes)+wrapper(kind,'u64')
     if kind=='interleaved32':return PRELUDE+interleaved32(unroll)+wrapper(kind,'u32')
     raise ValueError(kind)

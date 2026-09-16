@@ -180,88 +180,20 @@ def accept_state(fresh, seen_block):
     return fresh, fresh['block']
 
 
-# Keccak-f[1600]. The message is 84 bytes, so one block: lanes 0-3 carry the
-# seed, 4-6 the address and the top of the nonce, and only the low 64 bits of
-# the nonce move - the halves of lanes 9 and 10 written below.
-SOURCE = r'''
-typedef unsigned long long u64;
-__constant__ u64 RC[24]={
-0x0000000000000001ULL,0x0000000000008082ULL,0x800000000000808aULL,0x8000000080008000ULL,
-0x000000000000808bULL,0x0000000080000001ULL,0x8000000080008081ULL,0x8000000000008009ULL,
-0x000000000000008aULL,0x0000000000000088ULL,0x0000000080008009ULL,0x000000008000000aULL,
-0x000000008000808bULL,0x800000000000008bULL,0x8000000000008089ULL,0x8000000000008003ULL,
-0x8000000000008002ULL,0x8000000000000080ULL,0x000000000000800aULL,0x800000008000000aULL,
-0x8000000080008081ULL,0x8000000000008080ULL,0x0000000080000001ULL,0x8000000080008008ULL};
-__constant__ int RHO[25]={0,1,62,28,27,36,44,6,55,20,3,10,43,25,39,41,45,15,21,8,18,2,61,56,14};
+# The kernel is generated, not written out: kernels.py emits a fully unrolled
+# Keccak with one named register per lane and no arrays at all. The hand-rolled
+# version this replaces kept a 25-entry array inside the round loop, which the
+# compiler spills to local memory - it measured 1.78 GH/s on a card that does
+# better than four.
+#
+# The nonce's low 64 bits live in lanes 9 and 10 here, because the message
+# opens with a 32-byte seed rather than a 20-byte address.
+NONCE_LANES = (9, 10)
 
-__device__ __forceinline__ u64 rol(u64 x,int n){ return n ? ((x<<n)|(x>>(64-n))) : x; }
-__device__ __forceinline__ unsigned int bsw32(unsigned int x){
-  return (x>>24)|((x>>8)&0xff00u)|((x<<8)&0xff0000u)|(x<<24);
-}
-__device__ __forceinline__ u64 bsw64(u64 x){
-  x=((x&0x00ff00ff00ff00ffULL)<<8)|((x>>8)&0x00ff00ff00ff00ffULL);
-  x=((x&0x0000ffff0000ffffULL)<<16)|((x>>16)&0x0000ffff0000ffffULL);
-  return (x<<32)|(x>>32);
-}
 
-__device__ __forceinline__ void digest(const u64* base, u64 nonce, u64* out){
-  u64 s[25];
-  #pragma unroll
-  for(int i=0;i<17;i++) s[i]=base[i];
-  #pragma unroll
-  for(int i=17;i<25;i++) s[i]=0ULL;
-  // Bytes 76..79 are the nonce's high word, 80..83 its low word, both big
-  // endian inside little-endian lanes.
-  unsigned int hi=(unsigned int)(nonce>>32), lo=(unsigned int)nonce;
-  s[9]=(s[9]&0x00000000ffffffffULL)|((u64)bsw32(hi)<<32);
-  s[10]=(s[10]&0xffffffff00000000ULL)|(u64)bsw32(lo);
-  for(int r=0;r<24;r++){
-    u64 c0=s[0]^s[5]^s[10]^s[15]^s[20];
-    u64 c1=s[1]^s[6]^s[11]^s[16]^s[21];
-    u64 c2=s[2]^s[7]^s[12]^s[17]^s[22];
-    u64 c3=s[3]^s[8]^s[13]^s[18]^s[23];
-    u64 c4=s[4]^s[9]^s[14]^s[19]^s[24];
-    u64 d0=c4^rol(c1,1), d1=c0^rol(c2,1), d2=c1^rol(c3,1), d3=c2^rol(c4,1), d4=c3^rol(c0,1);
-    u64 b[25];
-    #pragma unroll
-    for(int y=0;y<5;y++){
-      #pragma unroll
-      for(int x=0;x<5;x++){
-        u64 d = x==0?d0:(x==1?d1:(x==2?d2:(x==3?d3:d4)));
-        b[y+5*((2*x+3*y)%5)] = rol(s[x+5*y]^d, RHO[x+5*y]);
-      }
-    }
-    #pragma unroll
-    for(int y=0;y<5;y++){
-      #pragma unroll
-      for(int x=0;x<5;x++) s[x+5*y]=b[x+5*y]^((~b[(x+1)%5+5*y])&b[(x+2)%5+5*y]);
-    }
-    s[0]^=RC[r];
-  }
-  // The digest read big-endian: lane 0 holds its most significant bytes.
-  #pragma unroll
-  for(int i=0;i<4;i++) out[i]=bsw64(s[i]);
-}
-
-extern "C" __global__ void probe(const u64* base, u64 start, unsigned int count, u64* out){
-  unsigned int i=blockIdx.x*blockDim.x+threadIdx.x;
-  if(i<count) digest(base,start+i,out+4*i);
-}
-
-extern "C" __global__ void search(const u64* base, const u64* target, u64 start, u64 count,
-                                  unsigned int* found, u64* result){
-  u64 stride=(u64)gridDim.x*blockDim.x;
-  for(u64 i=(u64)blockIdx.x*blockDim.x+threadIdx.x;i<count;i+=stride){
-    if(*found) return;
-    u64 h[4]; u64 nonce=start+i;
-    digest(base,nonce,h);
-    bool pass=false;
-    #pragma unroll
-    for(int k=0;k<4;k++){ if(h[k]<target[k]){pass=true;break;} if(h[k]>target[k]) break; }
-    if(pass){ if(atomicExch(found,1u)==0u) *result=nonce; return; }
-  }
-}
-'''
+def kernel_source():
+    from kernels import source
+    return source('scalar64', 1, NONCE_LANES)
 
 
 def message(seed_hex, address, nonce):
@@ -295,11 +227,15 @@ def worker(device, seed_hex, address, jobs, results, stop, options):
         import cupy as cp
         import numpy as np
         cp.cuda.Device(device).use()
-        name = cp.cuda.runtime.getDeviceProperties(device)['name']
+        props = cp.cuda.runtime.getDeviceProperties(device)
+        sms = int(props['multiProcessorCount'])
+        name = props['name']
         name = name.decode() if isinstance(name, bytes) else name
-        module = cp.RawModule(code=SOURCE, options=('--std=c++11',))
-        probe, search = module.get_function('probe'), module.get_function('search')
-        results.put(dict(type='status', device=device, message='compiled on ' + name))
+        module = cp.RawModule(code=kernel_source(), options=('--std=c++11',))
+        probe = module.get_function('probe_scalar64')
+        search = module.get_function('search_scalar64')
+        results.put(dict(type='status', device=device,
+                         message=f'compiled on {name}, {sms} SMs'))
 
         # Nothing real is hashed until this GPU reproduces a digest the CPU
         # agrees with, on the very layout the contract accepted.
@@ -342,8 +278,10 @@ def worker(device, seed_hex, address, jobs, results, stop, options):
             found.fill(0)
             began = time.perf_counter()
             start = secrets.randbits(63)
-            search((options['blocks'],), (256,),
-                   (base, target, np.uint64(start), np.uint64(batch), found, result))
+            threads = 256
+            grid = min((batch + threads - 1) // threads, sms * options['blocks_per_sm'])
+            search((grid,), (threads,),
+                   (base, target, np.uint64(start), np.uint32(batch), found, result))
             cp.cuda.Stream.null.synchronize()
             elapsed = time.perf_counter() - began
             counted += batch
@@ -360,7 +298,7 @@ def worker(device, seed_hex, address, jobs, results, stop, options):
             if now - reported >= 10:
                 results.put(dict(type='rate', device=device, hps=counted / (now - reported)))
                 counted, reported = 0, now
-            batch = max(1 << 18, min(1 << 30, int(batch * min(
+            batch = max(1 << 18, min(1 << 31, int(batch * min(
                 2, max(.5, options['batch_ms'] / 1000 / max(elapsed, 1e-6))))))
     except BaseException as exc:
         results.put(dict(type='error', device=device, error=f'{type(exc).__name__}: {str(exc)[:200]}'))
@@ -401,7 +339,8 @@ def main():
                         help='allow a transaction that actually costs USDC. Without it --coin-pct'
                              ' must be 0 and every mint is free bar the gas')
     parser.add_argument('--batch-ms', type=float, default=200)
-    parser.add_argument('--blocks', type=int, default=2048)
+    parser.add_argument('--blocks-per-sm', type=int, default=8,
+                        help='thread blocks per streaming multiprocessor')
     parser.add_argument('--poll', type=float, default=2.)
     parser.add_argument('--self-test', action='store_true',
                         help='compile the kernel, check it against the CPU, exit. No key, nothing sent')
@@ -506,7 +445,8 @@ def main():
     context = mp.get_context('spawn')
     results = context.Queue()
     stop = context.Event()
-    options = dict(batch=1 << 22, batch_ms=args.batch_ms, blocks=args.blocks)
+    options = dict(batch=1 << 22, batch_ms=args.batch_ms,
+                   blocks_per_sm=args.blocks_per_sm)
     queues, workers = {}, {}
     for device in devices:
         queues[device] = context.Queue(maxsize=2)

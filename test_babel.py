@@ -128,3 +128,48 @@ class FreeOnlyTests(unittest.TestCase):
             [sys.executable, 'babel.py', '--coin-pct', '0'],
             capture_output=True, text=True, timeout=120)
         self.assertNotIn('--pay to allow', allowed.stdout + allowed.stderr)
+
+
+class KernelTests(unittest.TestCase):
+    """The generated kernel, and the one thing that made it slow before.
+
+    The hand-written version kept `u64 b[25]` inside the round loop. An array
+    the compiler cannot prove it can keep in registers goes to local memory,
+    and the card then spends its time on loads: six RTX 5090s managed 1.78
+    GH/s between them, less than one of them should do alone. The generator
+    emits one named register per lane and no array at all.
+    """
+
+    def test_the_generated_kernel_has_no_arrays_and_patches_the_right_lanes(self):
+        from kernels import source
+        src = source('scalar64', 1, babel.NONCE_LANES)
+        self.assertIn('s9=(s9&0xffffffffULL)', src, 'lane 9 takes the nonce high half')
+        self.assertIn('s10=(s10&0xffffffff00000000ULL)', src, 'lane 10 takes the low half')
+        for spelling in ('u64 b[', 'u64 s[', 'u64 w['):
+            self.assertNotIn(spelling, src,
+                             f'{spelling} is the local-memory spill this replaced')
+        self.assertIn('probe_scalar64', src)
+        self.assertIn('search_scalar64', src)
+
+    def test_the_default_lanes_are_left_alone_for_the_other_miners(self):
+        # bot.py hashes a message that opens with an address, so its nonce
+        # sits in lanes 5 and 6. Changing the shared generator must not move
+        # it.
+        from kernels import source
+        src = source('scalar64', 1)
+        self.assertIn('s5=(s5&0xffffffffULL)', src)
+        self.assertIn('s6=(s6&0xffffffff00000000ULL)', src)
+
+    def test_the_lane_patch_rebuilds_the_real_block(self):
+        seed, addr = '0x' + 'ab' * 32, '0x' + 'cd' * 20
+        for prefix, low in [(0, 0), (7, 0xdeadbeefcafebabe), ((1 << 192) - 1, (1 << 64) - 1)]:
+            nonce = (prefix << 64) | low
+            lanes = list(babel.base_lanes(seed, addr, prefix))
+            swapped = int.from_bytes(low.to_bytes(8, 'big')[::-1], 'big')
+            lanes[9] = (lanes[9] & 0xFFFFFFFF) | ((swapped << 32) & 0xFFFFFFFFFFFFFFFF)
+            lanes[10] = (lanes[10] & 0xFFFFFFFF00000000) | (swapped >> 32)
+            block = b''.join(x.to_bytes(8, 'little') for x in lanes)
+            want = bytearray(babel.message(seed, addr, nonce))
+            want += b'\x01' + bytes(136 - 84 - 1)
+            want[135] ^= 0x80
+            self.assertEqual(block, bytes(want[:136]), f'nonce {nonce:#x}')
