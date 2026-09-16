@@ -30,7 +30,12 @@ import secrets
 import sys
 import time
 
-CONTRACT = '0x00000000000000000000000000000000000bABE1'
+# The site publishes where it deployed. The address baked into its bundle -
+# 0x...bABE1 - belongs to its mock preview chain, where lay() answers "0xmock"
+# and nothing is ever sent; taking that one for the real tower is how a rig
+# ends up waiting for a contract that was never going to appear.
+DEPLOYMENTS_URL = 'https://towerofbabel.fly.dev/deployments.json'
+CONTRACT = '0x07b5AB324fFD5f2CcCfd178B8f225E5419C5736c'
 CHAIN_ID = 5042
 EXPLORER = 'https://explorer.arc.io/tx/'
 RPCS = ['https://rpc.mainnet.arc.io']
@@ -43,6 +48,9 @@ SELECTOR = {
     'lay': '0x517ec447',         # lay(uint256 sponsor, uint256 nonce) payable
 }
 BASIS_POINTS = 10_000
+# Arc's USDC carries eighteen decimals, not six.
+COIN = 10 ** 18
+MAX_BRICKS = 8190
 # The site sends a plain wallet transaction; a brick is an ERC-721 mint with a
 # payment and a hash check, so this is generous rather than measured.
 MINT_GAS = 0x50000
@@ -360,6 +368,21 @@ def worker(device, seed_hex, address, jobs, results, stop, options):
 
 
 
+def resolve_contract():
+    """Ask the site where it actually deployed, rather than trusting a constant.
+
+    The address in the bundle is its preview chain's. This one is published,
+    versioned and the same thing the site itself reads at load.
+    """
+    try:
+        import requests
+        rows = requests.get(DEPLOYMENTS_URL, timeout=10).json()
+        return rows[str(CHAIN_ID)]['tower']
+    except Exception as exc:
+        log(f'could not read deployments.json ({type(exc).__name__}); using the built-in address')
+        return None
+
+
 def brick_bits(target):
     """How many leading zero bits the target asks for, for a readable line."""
     return 256 - target.bit_length() if target else 256
@@ -382,6 +405,8 @@ def main():
     parser.add_argument('--poll', type=float, default=2.)
     parser.add_argument('--self-test', action='store_true',
                         help='compile the kernel, check it against the CPU, exit. No key, nothing sent')
+    parser.add_argument('--no-resolve', action='store_true',
+                        help='trust the built-in address instead of reading deployments.json')
     parser.add_argument('--wait', action='store_true',
                         help='sit and watch until the contract is deployed and the seed is revealed')
     parser.add_argument('--max-mints', type=int, default=0, help='stop after this many, 0 for no limit')
@@ -397,6 +422,12 @@ def main():
             f'--coin-pct {args.coin_pct:g} would pay {args.coin_pct:g}% of every brick. '
             f'Add --pay to allow that, or use --coin-pct 0 to mine the whole price.')
 
+    global CONTRACT
+    if not args.no_resolve:
+        found = resolve_contract()
+        if found and found.lower() != CONTRACT.lower():
+            log(f'deployments.json names a different tower: {found}')
+            CONTRACT = found
     chain = Chain(args.rpc or RPCS)
     log(f'Arc chain {CHAIN_ID} | {CONTRACT} | paying {args.coin_pct:g}% of the price'
         f' ({coin_bps} bps)')
@@ -453,10 +484,14 @@ def main():
                 pass
 
     if not args.self_test:
-        log(f'brick #{state["laid"]} | price {state["price"] / 1e6:.4f} USDC'
-            f' | paying {state["price"] * coin_bps // BASIS_POINTS / 1e6:.4f}'
+        log(f'brick #{state["laid"]} | price {state["price"] / COIN:.4f} USDC'
+            f' | paying {state["price"] * coin_bps // BASIS_POINTS / COIN:.4f}'
             f' | target {brick_bits(state["target"])} leading zero bits'
             f' | startBits {state["start_bits"]}')
+    if not args.self_test:
+        left = MAX_BRICKS - state['laid']
+        bits = brick_bits(state['target'])
+        log(f'{left} brick(s) left of {MAX_BRICKS}; the target rises one bit every 256')
     if coin_bps >= BASIS_POINTS:
         log('paying the whole price: no work is needed, nonce 0 is accepted')
 
@@ -507,6 +542,9 @@ def main():
                     fresh = None
                 fresh, seen_block = accept_state(fresh, seen_block)
                 if fresh:
+                    if fresh['laid'] >= MAX_BRICKS:
+                        log(f'the tower is complete at {fresh["laid"]} bricks. {mined} laid.')
+                        break
                     if fresh['seed'] != state['seed']:
                         log('the seed changed; restart to pick it up')
                         break
@@ -561,7 +599,7 @@ def main():
                     sent = '0x' + signed.hash.hex().removeprefix('0x')
                     try:
                         chain.broadcast('0x' + signed.raw_transaction.hex())
-                        log(f'laying brick #{job["laid"]} for {value / 1e6:.4f} USDC -> {EXPLORER}{sent}')
+                        log(f'laying brick #{job["laid"]} for {value / COIN:.4f} USDC -> {EXPLORER}{sent}')
                     except Exception as exc:
                         log(f'broadcast failed: {exc}')
                         continue
