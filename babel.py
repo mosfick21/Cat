@@ -191,9 +191,15 @@ def accept_state(fresh, seen_block):
 NONCE_LANES = (9, 10)
 
 
-def kernel_source():
+# What the autotuner tries. The best one is not the same on every card: a T4
+# picked the bit-interleaved 32-bit form, and guessing instead of measuring is
+# how six RTX 5090s ran at a third of their speed.
+VARIANTS = [('scalar64', 1), ('interleaved32', 1), ('interleaved32', 2)]
+
+
+def kernel_source(kind='scalar64', unroll=1):
     from kernels import source
-    return source('scalar64', 1, NONCE_LANES)
+    return source(kind, unroll, NONCE_LANES)
 
 
 def message(seed_hex, address, nonce):
@@ -231,30 +237,79 @@ def worker(device, seed_hex, address, jobs, results, stop, options):
         sms = int(props['multiProcessorCount'])
         name = props['name']
         name = name.decode() if isinstance(name, bytes) else name
-        module = cp.RawModule(code=kernel_source(),
-                              options=('--std=c++14', '--use_fast_math'))
-        probe = module.get_function('probe_scalar64')
-        search = module.get_function('search_scalar64')
+        # Build every variant, check each against the CPU, then race them and
+        # keep the one this card is fastest at.
+        built = []
+        for kind, unroll in VARIANTS:
+            try:
+                module = cp.RawModule(code=kernel_source(kind, unroll),
+                                      options=('--std=c++14', '--use_fast_math'))
+                built.append((f'{kind}/u{unroll}', kind,
+                              module.get_function(f'probe_{kind}'),
+                              module.get_function(f'search_{kind}')))
+            except Exception as exc:
+                results.put(dict(type='status', device=device,
+                                 message=f'{kind}/u{unroll} would not build: {str(exc)[:60]}'))
+        if not built:
+            raise RuntimeError('no kernel variant would build')
         results.put(dict(type='status', device=device,
-                         message=f'compiled on {name}, {sms} SMs'))
+                         message=f'compiled on {name}, {sms} SMs,'
+                                 f' {len(built)} kernel(s)'))
 
-        # Nothing real is hashed until this GPU reproduces a digest the CPU
-        # agrees with, on the very layout the contract accepted.
+        from core import base32
+
+        def make_base(kind, prefix):
+            lanes = base_lanes(seed_hex, address, prefix)
+            if kind == 'scalar64':
+                return cp.asarray(np.asarray(lanes, dtype=np.uint64))
+            return cp.asarray(np.asarray(base32(lanes), dtype=np.uint32))
+
+        # Nothing real is hashed until every variant on this card reproduces a
+        # digest the CPU agrees with. A kernel that is fast and wrong is worse
+        # than no kernel at all.
         prefix = secrets.randbits(192)
-        base = cp.asarray(np.asarray(base_lanes(seed_hex, address, prefix), dtype=np.uint64))
-        out = cp.zeros(8 * 4, dtype=cp.uint64)
-        start = secrets.randbits(50)
-        probe((1,), (8,), (base, np.uint64(start), np.uint32(8), out))
-        rows = out.get().reshape(8, 4)
         checked = 0
-        for offset, row in enumerate(rows):
-            got = b''.join(int(x).to_bytes(8, 'big') for x in row)
-            nonce = ((prefix << 64) | ((start + offset) & 0xFFFFFFFFFFFFFFFF)) & ((1 << 256) - 1)
-            if got != cpu_digest(seed_hex, address, nonce):
-                raise RuntimeError('GPU Keccak disagrees with the CPU')
-            checked += 1
+        for label, kind, probe, _ in built:
+            base = make_base(kind, prefix)
+            out = cp.zeros(8 * 4, dtype=cp.uint64)
+            start = secrets.randbits(50)
+            probe((1,), (8,), (base, np.uint64(start), np.uint32(8), out))
+            for offset, row in enumerate(out.get().reshape(8, 4)):
+                got = b''.join(int(x).to_bytes(8, 'big') for x in row)
+                nonce = ((prefix << 64) | ((start + offset) & 0xFFFFFFFFFFFFFFFF)) & ((1 << 256) - 1)
+                if got != cpu_digest(seed_hex, address, nonce):
+                    raise RuntimeError(f'{label} disagrees with the CPU')
+                checked += 1
+
+        # Race them on this card, over an impossible target so nothing is ever
+        # found and every hash counts.
+        impossible = cp.asarray(np.asarray([0, 0, 0, 1], dtype=np.uint64))
+        tune_found = cp.zeros(1, dtype=cp.uint32)
+        tune_result = cp.zeros(64, dtype=cp.uint64)
+        best, chosen = 0.0, None
+        for label, kind, _, search_fn in built:
+            base = make_base(kind, prefix)
+            for threads in (128, 256):
+                for per_sm in (4, 8, 16):
+                    count = 1 << 24
+                    grid = min((count + threads - 1) // threads, sms * per_sm)
+                    tune_found.fill(0)
+                    began = time.perf_counter()
+                    search_fn((grid,), (threads,),
+                              (base, impossible, np.uint64(0), np.uint32(count),
+                               tune_found, tune_result))
+                    cp.cuda.Stream.null.synchronize()
+                    rate = count / max(time.perf_counter() - began, 1e-9)
+                    if rate > best:
+                        best, chosen = rate, (label, kind, search_fn, threads, per_sm)
+        label, kind, search, threads, per_sm = chosen
+        results.put(dict(type='status', device=device,
+                         message=f'{label} at {threads} threads x {per_sm}/SM'
+                                 f' -> {best / 1e9:.2f} GH/s'))
         results.put(dict(type='ready', device=device, name=name, checked=checked))
 
+        # Whichever variant won wants its own shape of base state.
+        base = make_base(kind, prefix)
         found = cp.zeros(1, dtype=cp.uint32)
         # The kernel records up to 64 hits; one slot was a write past the end.
         result = cp.zeros(64, dtype=cp.uint64)
@@ -280,8 +335,7 @@ def worker(device, seed_hex, address, jobs, results, stop, options):
             found.fill(0)
             began = time.perf_counter()
             start = secrets.randbits(63)
-            threads = 256
-            grid = min((batch + threads - 1) // threads, sms * options['blocks_per_sm'])
+            grid = min((batch + threads - 1) // threads, sms * per_sm)
             search((grid,), (threads,),
                    (base, target, np.uint64(start), np.uint32(batch), found, result))
             cp.cuda.Stream.null.synchronize()
@@ -295,7 +349,7 @@ def worker(device, seed_hex, address, jobs, results, stop, options):
                 # A fresh prefix after every win, so two proofs never share a
                 # search space and the next one is not a repeat of this one.
                 prefix = secrets.randbits(192)
-                base = cp.asarray(np.asarray(base_lanes(seed_hex, address, prefix), dtype=np.uint64))
+                base = make_base(kind, prefix)
             now = time.monotonic()
             if now - reported >= 10:
                 results.put(dict(type='rate', device=device, hps=counted / (now - reported)))
@@ -340,9 +394,9 @@ def main():
     parser.add_argument('--pay', action='store_true',
                         help='allow a transaction that actually costs USDC. Without it --coin-pct'
                              ' must be 0 and every mint is free bar the gas')
-    parser.add_argument('--batch-ms', type=float, default=200)
-    parser.add_argument('--blocks-per-sm', type=int, default=8,
-                        help='thread blocks per streaming multiprocessor')
+    parser.add_argument('--batch-ms', type=float, default=500,
+                        help='how long one launch should take. Longer means less of'
+                             ' the card left idle between launches')
     parser.add_argument('--poll', type=float, default=2.)
     parser.add_argument('--benchmark', type=float, metavar='SECONDS', default=0,
                         help='measure this box against an impossible target and exit.'
@@ -457,8 +511,7 @@ def main():
     context = mp.get_context('spawn')
     results = context.Queue()
     stop = context.Event()
-    options = dict(batch=1 << 22, batch_ms=args.batch_ms,
-                   blocks_per_sm=args.blocks_per_sm)
+    options = dict(batch=1 << 26, batch_ms=args.batch_ms)
     queues, workers = {}, {}
     for device in devices:
         queues[device] = context.Queue(maxsize=2)

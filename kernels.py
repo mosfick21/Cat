@@ -65,7 +65,7 @@ def scalar64(unroll=1, lanes=(5, 6)):
     return '\n'.join(lines+['}'])
 
 
-def interleaved32(unroll=1):
+def interleaved32(unroll=1, lanes=(5, 6)):
     erc,orc=zip(*(interleave(x) for x in RC))
     lines=['HD void interleaved32(const u32* base,u64 nonce,u64* out){']
     for name,rc in [('e',erc),('o',orc)]:
@@ -73,9 +73,10 @@ def interleaved32(unroll=1):
     for i in range(25):
         lines += [f'u32 e{i}='+ (f'base[{2*i}];' if i<17 else '0;'),
                   f'u32 o{i}='+ (f'base[{2*i+1}];' if i<17 else '0;')]
+    a, b = lanes
     lines += ['u64 n=bswap(nonce);u32 lo=(u32)n,hi=(u32)(n>>32);',
-              'e5=(e5&0xffffU)|(compact(lo)<<16);o5=(o5&0xffffU)|(compact(lo>>1)<<16);',
-              'e6=(e6&0xffff0000U)|compact(hi);o6=(o6&0xffff0000U)|compact(hi>>1);',
+              f'e{a}=(e{a}&0xffffU)|(compact(lo)<<16);o{a}=(o{a}&0xffffU)|(compact(lo>>1)<<16);',
+              f'e{b}=(e{b}&0xffff0000U)|compact(hi);o{b}=(o{b}&0xffff0000U)|compact(hi>>1);',
               f'#pragma unroll {unroll}', 'for(int r=0;r<24;r++){']
     for part in ('e','o'):
         for x in range(5):lines += [f'u32 c{part}{x}='+'^'.join(f'{part}{x+5*y}' for y in range(5))+';']
@@ -126,5 +127,5 @@ extern "C" __global__ void search_{name}(const {word}* base,const u64* target,u6
 
 def source(kind='scalar64', unroll=1, lanes=(5, 6)):
     if kind=='scalar64':return PRELUDE+scalar64(unroll, lanes)+wrapper(kind,'u64')
-    if kind=='interleaved32':return PRELUDE+interleaved32(unroll)+wrapper(kind,'u32')
+    if kind=='interleaved32':return PRELUDE+interleaved32(unroll, lanes)+wrapper(kind,'u32')
     raise ValueError(kind)
