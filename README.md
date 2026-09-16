@@ -249,3 +249,34 @@ claim reverts and comes back down after three clean mints. `prspct.py mine
 --address 0x...` digs nonces on a machine that never sees a key, to be sent
 from elsewhere. `prspct_cell.py` is the same program as one paste-and-run
 Kaggle cell.
+
+## Tower of Babel (`babel.py`)
+
+A fourth proof of work, and the first where the work is optional. On Arc
+(chain 5042, `https://rpc.mainnet.arc.io`), contract
+`0x00000000000000000000000000000000000bABE1`.
+
+`lay(uint256 sponsor, uint256 nonce)` is payable, and `targetAt(n, coinBps)`
+returns an easier target the more of the price you pay. Pay the whole price -
+`--coin-pct 100` - and no hashing happens at all, nonce zero is accepted. Pay
+less and the shortfall is made up in hashes. So the question is not whether
+you can mint, but how much of the price a GPU can replace. Arc's native coin
+is USDC, so the price and the gas are the same thing.
+
+The proof is `keccak256(seed[32] ++ sender[20] ++ nonce[32])` - the same 84
+bytes and the same single Keccak block as ZEROS, so the kernel is shared - and
+it wins below the target the contract hands back for the brick being laid.
+That layout is not documented; it came out of the site's own miner worker, and
+`test_babel.py` holds that worker's packing transcribed as the reference.
+Putting the nonce in little-endian fails three of the five tests.
+
+```
+python3 babel.py --self-test                 # compile, check against the CPU, exit
+export BABEL_PRIVATE_KEY=0x...
+python3 babel.py --gpus all --coin-pct 0 --wait
+```
+
+`--wait` sits on the contract until it is deployed and the seed is revealed:
+it had no code at all when this was written. `--coin-pct` is the whole
+decision - 0 pays nothing and mines everything, 100 pays everything and mines
+nothing.

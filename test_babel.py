@@ -1,0 +1,103 @@
+"""The Tower of Babel proof, against the site's own miner.
+
+Nothing on chain to check this against - the tower had no code deployed when
+this was written. So the reference is the site's worker, which builds the
+message byte by byte before hashing it:
+
+    function D(seed, sender, nonce) {
+      const n = new Uint8Array(84);
+      n.set(hex(seed, 32), 0);     // 0..31   seed
+      n.set(hex(sender, 20), 32);  // 32..51  sender
+      for (let f = 83; f >= 52; f--) { n[f] = nonce & 0xff; nonce >>= 8; }
+    }
+
+and wins on `M(digest, target)`, a plain big-endian byte comparison.
+"""
+import unittest
+
+import babel
+
+
+SEED = '0x' + 'ab' * 32
+SENDER = '0x5d9CEAaFFa9fdE281750ec070Da6332dA9cefdC8'
+
+
+def site_message(seed, sender, nonce):
+    """The site's D(), transcribed. The thing this file exists to agree with."""
+    out = bytearray(84)
+    out[0:32] = bytes.fromhex(seed[2:])
+    out[32:52] = bytes.fromhex(sender[2:])
+    value = nonce
+    for i in range(83, 51, -1):
+        out[i] = value & 0xFF
+        value >>= 8
+    return bytes(out)
+
+
+class MessageTests(unittest.TestCase):
+    def test_the_message_matches_the_site_byte_for_byte(self):
+        for nonce in (0, 1, 2 ** 64 - 1, 2 ** 255, (1 << 256) - 1, 0xdeadbeefcafe):
+            self.assertEqual(babel.message(SEED, SENDER, nonce),
+                             site_message(SEED, SENDER, nonce),
+                             f'nonce {nonce:#x} packs differently from the site')
+
+    def test_it_is_84_bytes_in_one_order(self):
+        body = babel.message(SEED, SENDER, 0x1234)
+        self.assertEqual(len(body), 84)
+        self.assertEqual(body[:32], bytes.fromhex('ab' * 32))
+        self.assertEqual(body[32:52], bytes.fromhex(SENDER[2:]))
+        self.assertEqual(body[52:], (0x1234).to_bytes(32, 'big'))
+
+
+class LaneTests(unittest.TestCase):
+    """The kernel patches the nonce into two lanes; check that arithmetic.
+
+    Nothing on this machine can run the kernel, but the same surgery in Python
+    must rebuild the exact 136 bytes Keccak absorbs. A wrong shift here is a
+    miner that searches for ever and finds nothing.
+    """
+
+    def padded(self, nonce):
+        body = bytearray(babel.message(SEED, SENDER, nonce))
+        body += b'\x01' + bytes(136 - 84 - 1)
+        body[135] ^= 0x80
+        return bytes(body)
+
+    def lanes_from_kernel(self, prefix, low):
+        base = list(babel.base_lanes(SEED, SENDER, prefix))
+        hi, lo = (low >> 32) & 0xFFFFFFFF, low & 0xFFFFFFFF
+        swap = lambda x: int.from_bytes(x.to_bytes(4, 'big')[::-1], 'big')
+        base[9] = (base[9] & 0xFFFFFFFF) | (swap(hi) << 32)
+        base[10] = (base[10] & 0xFFFFFFFF00000000) | swap(lo)
+        return base
+
+    def test_the_patched_lanes_rebuild_the_real_block(self):
+        for prefix, low in [(0, 0), (1, 1), (0x123456789abcdef, 0xfedcba9876543210),
+                            ((1 << 192) - 1, (1 << 64) - 1), (7, 0xffffffff00000000)]:
+            nonce = (prefix << 64) | low
+            lanes = self.lanes_from_kernel(prefix, low)
+            got = b''.join(x.to_bytes(8, 'little') for x in lanes) + bytes(136 - 17 * 8)
+            self.assertEqual(got, self.padded(nonce),
+                             f'lane surgery wrong for prefix={prefix:#x} low={low:#x}')
+
+
+class CalldataTests(unittest.TestCase):
+    def test_lay_names_the_sponsor_then_the_nonce(self):
+        nonce = 0xdeadbeef
+        data = babel.SELECTOR['lay'] + babel.word(3) + babel.word(nonce)
+        self.assertEqual(len(data), 2 + 8 + 64 * 2)
+        self.assertTrue(data.startswith('0x517ec447'), 'lay(uint256,uint256)')
+        self.assertEqual(int(data[10:74], 16), 3)
+        self.assertEqual(int(data[74:], 16), nonce)
+
+    def test_paying_the_whole_price_is_ten_thousand_basis_points(self):
+        # The one number that decides whether any hashing happens at all.
+        self.assertEqual(babel.BASIS_POINTS, 10_000)
+        price = 1_500_000
+        self.assertEqual(price * babel.BASIS_POINTS // babel.BASIS_POINTS, price)
+        self.assertEqual(price * 0 // babel.BASIS_POINTS, 0, 'coin 0 pays nothing')
+        self.assertEqual(price * 5_000 // babel.BASIS_POINTS, price // 2)
+
+
+if __name__ == '__main__':
+    unittest.main()
