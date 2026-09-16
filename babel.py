@@ -401,6 +401,26 @@ def main():
     log(f'Arc chain {CHAIN_ID} | {CONTRACT} | paying {args.coin_pct:g}% of the price'
         f' ({coin_bps} bps)')
 
+    # The key is asked for before anything waits on the chain. The tower was
+    # not deployed when this was written, so the wait can be hours or days,
+    # and a run that asks for the key at the end of it only mints if somebody
+    # happened to be sitting at the terminal when the tower opened.
+    account = None
+    if args.self_test:
+        address = '0x' + '11' * 20
+    else:
+        key = os.environ.get('BABEL_PRIVATE_KEY')
+        if not key:
+            if not sys.stdin.isatty():
+                raise SystemExit('Set BABEL_PRIVATE_KEY, or run on a terminal')
+            import getpass
+            key = getpass.getpass('Mining wallet private key (hidden): ').strip()
+        from eth_account import Account
+        account = Account.from_key(key)
+        address = account.address
+        del key
+        log('laying bricks for ' + address)
+
     # A self-test is about this machine, not about the tower: it compiles the
     # kernel and checks it against the CPU. Making it wait for a contract that
     # does not exist yet would make it useless in the one week it is needed -
@@ -439,22 +459,6 @@ def main():
             f' | startBits {state["start_bits"]}')
     if coin_bps >= BASIS_POINTS:
         log('paying the whole price: no work is needed, nonce 0 is accepted')
-
-    account = None
-    if args.self_test:
-        address = '0x' + '11' * 20
-    else:
-        key = os.environ.get('BABEL_PRIVATE_KEY')
-        if not key:
-            if not sys.stdin.isatty():
-                raise SystemExit('Set BABEL_PRIVATE_KEY, or run on a terminal')
-            import getpass
-            key = getpass.getpass('Mining wallet private key (hidden): ').strip()
-        from eth_account import Account
-        account = Account.from_key(key)
-        address = account.address
-        del key
-        log('laying bricks for ' + address)
 
     if args.gpus == 'all':
         import cupy as cp
