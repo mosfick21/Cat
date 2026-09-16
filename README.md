@@ -276,6 +276,11 @@ export BABEL_PRIVATE_KEY=0x...
 python3 babel.py --gpus all --coin-pct 0 --wait
 ```
 
+`--coin-pct 0` is the free path: the transaction carries no value and the GPU
+makes up the whole price. Anything above zero spends real USDC and is refused
+outright unless `--pay` is given as well, so a mistyped percentage cannot
+empty a wallet a brick at a time.
+
 `--wait` sits on the contract until it is deployed and the seed is revealed:
 it had no code at all when this was written. `--coin-pct` is the whole
 decision - 0 pays nothing and mines everything, 100 pays everything and mines

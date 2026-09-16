@@ -374,6 +374,9 @@ def main():
                         help='how much of the price to pay, 0-100. 100 needs no work at all;'
                              ' every point below it is made up in hashes')
     parser.add_argument('--sponsor', type=int, default=0, help='the brick id that sponsored you, 0 for none')
+    parser.add_argument('--pay', action='store_true',
+                        help='allow a transaction that actually costs USDC. Without it --coin-pct'
+                             ' must be 0 and every mint is free bar the gas')
     parser.add_argument('--batch-ms', type=float, default=200)
     parser.add_argument('--blocks', type=int, default=2048)
     parser.add_argument('--poll', type=float, default=2.)
@@ -387,6 +390,12 @@ def main():
     if not 0 <= args.coin_pct <= 100:
         raise SystemExit('--coin-pct must be between 0 and 100')
     coin_bps = int(round(args.coin_pct * BASIS_POINTS / 100))
+    # A mistyped percentage is a wallet emptied a brick at a time, so paying
+    # anything at all has to be asked for in as many words.
+    if coin_bps > 0 and not args.pay:
+        raise SystemExit(
+            f'--coin-pct {args.coin_pct:g} would pay {args.coin_pct:g}% of every brick. '
+            f'Add --pay to allow that, or use --coin-pct 0 to mine the whole price.')
 
     chain = Chain(args.rpc or RPCS)
     log(f'Arc chain {CHAIN_ID} | {CONTRACT} | paying {args.coin_pct:g}% of the price'
@@ -528,6 +537,8 @@ def main():
                         log('self-test solution found; nothing sent')
                         continue
                     value = state['price'] * coin_bps // BASIS_POINTS
+                    if value and not args.pay:
+                        raise RuntimeError('refusing to send a paid mint without --pay')
                     tx = {'chainId': CHAIN_ID, 'to': CONTRACT, 'value': int(value),
                           'gas': MINT_GAS,
                           'gasPrice': int(int(chain.call('eth_gasPrice', []), 16) * 1.2) + 1,

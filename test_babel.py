@@ -101,3 +101,30 @@ class CalldataTests(unittest.TestCase):
 
 if __name__ == '__main__':
     unittest.main()
+
+
+class FreeOnlyTests(unittest.TestCase):
+    """Paying has to be asked for; a mistyped percentage must not spend."""
+
+    def test_zero_coin_sends_nothing(self):
+        price = 1_500_000
+        self.assertEqual(price * 0 // babel.BASIS_POINTS, 0)
+
+    def test_the_guard_rejects_a_paying_percentage_without_the_flag(self):
+        import subprocess
+        import sys
+        refused = subprocess.run(
+            [sys.executable, 'babel.py', '--coin-pct', '50'],
+            capture_output=True, text=True, timeout=120)
+        self.assertNotEqual(refused.returncode, 0, 'a paid run must not start by accident')
+        self.assertIn('--pay', refused.stdout + refused.stderr)
+
+    def test_the_free_percentage_gets_past_the_guard(self):
+        # It stops later, at the contract that is not deployed - but it must
+        # not stop at the money guard, or free mining would be unreachable.
+        import subprocess
+        import sys
+        allowed = subprocess.run(
+            [sys.executable, 'babel.py', '--coin-pct', '0'],
+            capture_output=True, text=True, timeout=120)
+        self.assertNotIn('--pay to allow', allowed.stdout + allowed.stderr)
