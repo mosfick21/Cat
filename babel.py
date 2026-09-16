@@ -231,7 +231,8 @@ def worker(device, seed_hex, address, jobs, results, stop, options):
         sms = int(props['multiProcessorCount'])
         name = props['name']
         name = name.decode() if isinstance(name, bytes) else name
-        module = cp.RawModule(code=kernel_source(), options=('--std=c++11',))
+        module = cp.RawModule(code=kernel_source(),
+                              options=('--std=c++14', '--use_fast_math'))
         probe = module.get_function('probe_scalar64')
         search = module.get_function('search_scalar64')
         results.put(dict(type='status', device=device,
@@ -255,7 +256,8 @@ def worker(device, seed_hex, address, jobs, results, stop, options):
         results.put(dict(type='ready', device=device, name=name, checked=checked))
 
         found = cp.zeros(1, dtype=cp.uint32)
-        result = cp.zeros(1, dtype=cp.uint64)
+        # The kernel records up to 64 hits; one slot was a write past the end.
+        result = cp.zeros(64, dtype=cp.uint64)
         target = cp.zeros(4, dtype=cp.uint64)
         job, loaded = None, None
         batch = options['batch']
@@ -342,6 +344,10 @@ def main():
     parser.add_argument('--blocks-per-sm', type=int, default=8,
                         help='thread blocks per streaming multiprocessor')
     parser.add_argument('--poll', type=float, default=2.)
+    parser.add_argument('--benchmark', type=float, metavar='SECONDS', default=0,
+                        help='measure this box against an impossible target and exit.'
+                             ' No chain, no key, nothing sent - use it to settle'
+                             ' --blocks-per-sm rather than guessing')
     parser.add_argument('--self-test', action='store_true',
                         help='compile the kernel, check it against the CPU, exit. No key, nothing sent')
     parser.add_argument('--no-resolve', action='store_true',
@@ -376,7 +382,7 @@ def main():
     # and a run that asks for the key at the end of it only mints if somebody
     # happened to be sitting at the terminal when the tower opened.
     account = None
-    if args.self_test:
+    if args.self_test or args.benchmark:
         address = '0x' + '11' * 20
     else:
         key = os.environ.get('BABEL_PRIVATE_KEY')
@@ -395,10 +401,16 @@ def main():
     # kernel and checks it against the CPU. Making it wait for a contract that
     # does not exist yet would make it useless in the one week it is needed -
     # before the launch, on a box you are setting up in advance.
-    if args.self_test:
-        state = dict(seed='0x' + '11' * 32, laid=0, start_bits=22,
-                     price=0, target=(1 << 240), block=0, endpoint='(self-test)')
-        log('self-test: the kernel is checked against the CPU, the chain is not read')
+    if args.self_test or args.benchmark:
+        # An impossible target for the benchmark, so nothing is ever found and
+        # every hash counts; a wide one for the self-test, which only has to
+        # reach the card.
+        state = dict(seed='0x' + '11' * 32, laid=0, start_bits=22, price=0,
+                     target=1 if args.benchmark else (1 << 240),
+                     block=0, endpoint='(local)')
+        log('self-test: the kernel is checked against the CPU, the chain is not read'
+            if args.self_test else
+            f'benchmark: {args.benchmark:g}s against an impossible target, nothing is sent')
     else:
         state = None
     while state is None:
@@ -467,13 +479,23 @@ def main():
                 pass
 
     rates, ready = {}, set()
+    bench_until = 0.
     mined, lost = 0, 0
     job, seen_block = None, 0
     last_poll, last_print = 0., time.monotonic()
     try:
         while True:
             now = time.monotonic()
-            if now - last_poll >= args.poll:
+            if args.benchmark:
+                if bench_until and now >= bench_until:
+                    total = sum(rates.values())
+                    each = '  '.join(f'gpu{d}: {rates[d] / 1e9:.2f}' for d in sorted(rates))
+                    log(f'{total / 1e9:.2f} GH/s over {len(rates)}/{len(devices)} GPU')
+                    log(each)
+                    log(f'at 43 bits that is one brick every {2 ** 43 / total:.0f}s'
+                        if total else 'no GPU reported a rate')
+                    return
+            elif now - last_poll >= args.poll:
                 last_poll = now
                 try:
                     fresh = chain.state(coin_bps)
@@ -513,6 +535,10 @@ def main():
                     if args.self_test and len(ready) == len(devices):
                         log('kernel correct on every GPU. No key was asked for, nothing was sent.')
                         return
+                    if args.benchmark and len(ready) == len(devices):
+                        job = dict(target=1, laid=0)
+                        dispatch(job)
+                        bench_until = time.monotonic() + args.benchmark
                 if kind == 'rate':
                     rates[message_in['device']] = message_in['hps']
                 if kind == 'found':

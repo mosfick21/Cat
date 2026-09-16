@@ -110,11 +110,13 @@ extern "C" __global__ void probe_{name}(const {word}* base,u64 start,u32 count,u
  if(i<count){name}(base,start+i,hashes+4*i);
 }}
 extern "C" __global__ void search_{name}(const {word}* base,const u64* target,u64 start,u32 count,u32* found,u64* result){{
+ // The target is four words that never change inside a launch. Read once,
+ // into registers: reading it back out of global memory beside every hash is
+ // four loads the card could have spent hashing.
+ const u64 t0=target[0],t1=target[1],t2=target[2],t3=target[3];
  for(u64 i=(u64)blockIdx.x*blockDim.x+threadIdx.x;i<count;i+=(u64)gridDim.x*blockDim.x){{
   u64 h[4];{name}(base,start+i,h);
-  bool pass=false;
-  #pragma unroll
-  for(int k=0;k<4;k++){{if(h[k]<target[k]){{pass=true;break;}}if(h[k]>target[k])break;}}
+  bool pass = h[0]<t0 || (h[0]==t0 && (h[1]<t1 || (h[1]==t1 && (h[2]<t2 || (h[2]==t2 && h[3]<t3)))));
   if(pass){{u32 slot=atomicAdd(found,1U);if(slot<64U)result[slot]=start+i;}}
  }}
 }}
