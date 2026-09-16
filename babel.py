@@ -401,9 +401,16 @@ def main():
     log(f'Arc chain {CHAIN_ID} | {CONTRACT} | paying {args.coin_pct:g}% of the price'
         f' ({coin_bps} bps)')
 
-    # The tower was not deployed when this was written. Waiting is the whole
-    # point of being early, so it is a mode rather than an error.
-    state = None
+    # A self-test is about this machine, not about the tower: it compiles the
+    # kernel and checks it against the CPU. Making it wait for a contract that
+    # does not exist yet would make it useless in the one week it is needed -
+    # before the launch, on a box you are setting up in advance.
+    if args.self_test:
+        state = dict(seed='0x' + '11' * 32, laid=0, start_bits=22,
+                     price=0, target=(1 << 240), block=0, endpoint='(self-test)')
+        log('self-test: the kernel is checked against the CPU, the chain is not read')
+    else:
+        state = None
     while state is None:
         try:
             state = chain.state(coin_bps)
@@ -414,7 +421,7 @@ def main():
                     f'when this was written. Run with --wait to sit on it until it opens.')
             log('not open yet; waiting')
             time.sleep(15)
-    if int(state['seed'], 16) == 0:
+    if not args.self_test and int(state['seed'], 16) == 0:
         if not args.wait:
             raise SystemExit('The seed is not revealed yet; there is nothing to mine.')
         while int(state['seed'], 16) == 0:
@@ -425,10 +432,11 @@ def main():
             except Exception:
                 pass
 
-    log(f'brick #{state["laid"]} | price {state["price"] / 1e6:.4f} USDC'
-        f' | paying {state["price"] * coin_bps // BASIS_POINTS / 1e6:.4f}'
-        f' | target {brick_bits(state["target"])} leading zero bits'
-        f' | startBits {state["start_bits"]}')
+    if not args.self_test:
+        log(f'brick #{state["laid"]} | price {state["price"] / 1e6:.4f} USDC'
+            f' | paying {state["price"] * coin_bps // BASIS_POINTS / 1e6:.4f}'
+            f' | target {brick_bits(state["target"])} leading zero bits'
+            f' | startBits {state["start_bits"]}')
     if coin_bps >= BASIS_POINTS:
         log('paying the whole price: no work is needed, nonce 0 is accepted')
 
