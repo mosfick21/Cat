@@ -7,7 +7,15 @@ block - and the site says so itself, in the comment above its own worker: "a
 message of seed ++ miner ++ nonce is 84 bytes and fits one block of the rate".
 Nothing had to be recovered by trial this time.
 
-What differs from ZEROS is only how the target is reached. There is no
+Two things differ from ZEROS, and the second is the one that matters.
+
+The seed is not fixed. It moves with every bill - it is the last winner's
+proof - so anybody's mint throws away the work in flight. ZEROS could stop and
+ask for a restart because its seed never changed; doing that here would mean
+mining once and quitting, because on a live road somebody mints every few
+seconds. The run picks the new seed up and starts the cards again.
+
+The other is how the target is reached. There is no
 difficulty() to divide into 2^256; the bar is a bit count that climbs with the
 supply:
 
@@ -439,11 +447,28 @@ def main():
     stop = context.Event()
     options = dict(batch=1 << 22, batch_ms=args.batch_ms, blocks=args.blocks)
     queues, workers = {}, {}
-    for device in devices:
-        queues[device] = context.Queue(maxsize=2)
-        workers[device] = context.Process(target=worker, daemon=True,
-            args=(device, state['seed'], address, queues[device], results, stop, options))
-        workers[device].start()
+
+    def start_workers(seed_hex):
+        """Put every card to work on this seed, replacing whatever went before.
+
+        The seed changes with every bill here - it is the previous winner's
+        proof - so a mint by anybody invalidates the work in flight. ZEROS,
+        which this was rewritten from, had a fixed seed and could simply stop
+        and tell the operator to restart; doing that on trnpike means stopping
+        every time somebody else mints, which on a live road is constantly.
+        """
+        stop.clear()
+        for device in devices:
+            old = workers.get(device)
+            if old is not None and old.is_alive():
+                old.terminate()
+                old.join(timeout=2)
+            queues[device] = context.Queue(maxsize=2)
+            workers[device] = context.Process(target=worker, daemon=True,
+                args=(device, seed_hex, address, queues[device], results, stop, options))
+            workers[device].start()
+
+    start_workers(state['seed'])
 
     def dispatch(job):
         for q in queues.values():
@@ -490,8 +515,20 @@ def main():
 
                 if fresh:
                     if fresh['seed'] != state['seed']:
-                        log('the seed changed; restart to pick it up')
-                        return
+                        # Somebody minted, so the seed moved and every nonce in
+                        # flight is worthless. Pick the new one up and carry on
+                        # rather than stopping: on a live road this happens
+                        # every few seconds, and stopping means mining once.
+                        log(f'bill {fresh["next"]} went to someone else;'
+                            f' new seed, {fresh["bits"]} bits, working again')
+                        state = fresh
+                        job = None
+                        pending.clear()
+                        tx_nonce = None
+                        start_workers(fresh['seed'])
+                        job = dict(bits=fresh['bits'])
+                        dispatch(job)
+                        continue
                     if fresh['minted'] >= fresh['supply']:
                         log(f'SOLD OUT at {fresh["minted"]}/{fresh["supply"]}.'
                             f' Stopping; minted {mined}, lost {lost}.')
