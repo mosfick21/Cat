@@ -498,6 +498,8 @@ def main():
     # can only revert and pay for the privilege. Eighty-two sends bought one
     # bill and forty-five reverts before this existed.
     spent_on = None
+    # Proofs the chain itself refused before a fee was paid on them.
+    refused = 0
     job, seen_block, sent_nonce = None, 0, None
     last_poll, last_print = 0., time.monotonic()
     # Both are kept here rather than asked for at the moment of sending: the
@@ -611,10 +613,28 @@ def main():
                         # was already checked against the poll, the nonce is
                         # counted locally, and the gas price is refreshed on
                         # the poll like everything else.
+                        data = SELECTOR['mine'] + f'{nonce:064x}'
+                        # Asked before it is paid for. The contract answers
+                        # eth_call from this address for nothing, and a call
+                        # that reverts is a transaction that would have
+                        # reverted - the bill already taken, the proof already
+                        # spent, the bar moved. The site's own miner does the
+                        # same thing for the same reason.
+                        #
+                        # It cannot make a revert impossible: between this
+                        # answer and the block that includes us, somebody
+                        # else's mine() can still land first. It makes it rare,
+                        # which is the most a public chain allows.
+                        try:
+                            chain.call('eth_call', [{'from': address, 'to': CONTRACT,
+                                                     'data': data}, 'latest'])
+                        except Exception:
+                            refused += 1
+                            continue
                         tx = {'chainId': CHAIN_ID, 'to': CONTRACT, 'value': 0, 'gas': MINT_GAS,
                               'gasPrice': gas_price,
                               'nonce': tx_nonce,
-                              'data': SELECTOR['mine'] + f'{nonce:064x}'}
+                              'data': data}
                         signed = account.sign_transaction(tx)
                         sent = '0x' + signed.hash.hex().removeprefix('0x')
                         try:
@@ -645,7 +665,7 @@ def main():
                 each = ' '.join(f'gpu{d}:{rates[d]/1e6:.0f}' for d in sorted(rates))
                 log(f'{total/1e9:.2f} GH/s [{each}] | bill {state["next"]} at {bits} bits'
                     f' | a proof every ~{expect} | sent {sent_count}, minted {mined},'
-                    f' lost {lost}, dropped {stale}')
+                    f' lost {lost}, dropped {stale}, refused before paying {refused}')
                 last_print = time.monotonic()
     finally:
         stop.set()
