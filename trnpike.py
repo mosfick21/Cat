@@ -46,6 +46,15 @@ import secrets
 import sys
 import time
 
+# Run from a notebook cell (`%run`), `__main__` has no `__spec__`, and
+# multiprocessing's spawn start method reads it while preparing a child - so
+# the first worker dies with AttributeError before any card is touched. Fork
+# would avoid it and cannot be used: CUDA does not survive a fork. Giving
+# `__main__` the attribute spawn expects costs nothing and is the whole fix.
+import __main__ as _main
+if not hasattr(_main, '__spec__'):
+    _main.__spec__ = None
+
 CONTRACT = '0xe794e36Ee1Ca6ef4cEA6e68797B7c7aCb935420a'
 CHAIN_ID = 4663
 EXPLORER = 'https://robinhoodchain.blockscout.com/tx/'
