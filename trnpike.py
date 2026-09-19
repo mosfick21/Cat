@@ -59,6 +59,13 @@ CONTRACT = '0xe794e36Ee1Ca6ef4cEA6e68797B7c7aCb935420a'
 CHAIN_ID = 4663
 EXPLORER = 'https://robinhoodchain.blockscout.com/tx/'
 RPCS = ['https://rpc.mainnet.chain.robinhood.com/', 'https://robinhood.drpc.org']
+# Broadcasts go here first. Robinhood is an Arbitrum Orbit chain and publishes
+# the sequencer itself - the machine that orders transactions, which everything
+# else forwards to. Timed from a Kaggle-shaped host with real signed
+# transactions: sequencer 15 ms, the chain's public RPC 30, a premium endpoint
+# 270. It answers eth_sendRawTransaction and refuses every other method, so it
+# can never be read from and is never in RPCS.
+SUBMIT_RPCS = ['https://sequencer.mainnet.chain.robinhood.com'] + RPCS
 SELECTOR = {'seed': '0x7d94792a', 'next': '0x4c8fe526',
             'startBits': '0x37ff0e75', 'openAt': '0xa0e23ebd',
             'mine': '0x4d474898'}
@@ -154,7 +161,11 @@ class Chain:
         raise last
 
     def broadcast(self, raw_hex):
-        """Every endpoint at once; a duplicate is answered 'already known'."""
+        """Every submission route at once; a duplicate is 'already known'.
+
+        Not the read pool: the sequencer belongs here and answers nothing else,
+        and it is the fastest route the chain has.
+        """
         from concurrent.futures import ThreadPoolExecutor, as_completed
         payload = dict(jsonrpc='2.0', id=1, method='eth_sendRawTransaction', params=[raw_hex])
 
@@ -171,10 +182,11 @@ class Chain:
                 return 'already known'
             return RuntimeError(message)
 
-        pool = ThreadPoolExecutor(max_workers=len(self.urls))
+        routes = list(dict.fromkeys(SUBMIT_RPCS + self.urls))
+        pool = ThreadPoolExecutor(max_workers=len(routes))
         try:
             failure = None
-            for future in as_completed([pool.submit(one, u) for u in self.urls]):
+            for future in as_completed([pool.submit(one, u) for u in routes]):
                 outcome = future.result()
                 if not isinstance(outcome, BaseException):
                     return outcome
