@@ -398,6 +398,10 @@ def main():
     parser.add_argument('--blocks', type=int, default=2048, help='thread blocks per launch')
     parser.add_argument('--poll', type=float, default=2., help='seconds between chain reads')
     parser.add_argument('--self-test', action='store_true', help='check the kernel and exit; no key')
+    parser.add_argument('--rehearse', action='store_true',
+                        help='run the whole loop on the CPU at a trivial bar and send nothing:'
+                             ' find, verify, build and sign, then follow a seed change. Every bug'
+                             ' this file has shipped was in that path and none needed a GPU to see.')
     parser.add_argument('--max-mints', type=int, default=0, help='stop after this many, 0 for no limit')
     args = parser.parse_args()
     os.umask(0o077)
