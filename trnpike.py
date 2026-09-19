@@ -386,12 +386,22 @@ def main():
     if args.self_test:
         address = '0x' + '11' * 20
     else:
-        key = os.environ.get('ZEROS_PRIVATE_KEY')
+        # Asked for, not configured. A notebook has no terminal on its stdin,
+        # so refusing to prompt there - which the version this was rewritten
+        # from did - meant the only way in was an environment variable, and an
+        # environment variable holding a private key is a key written down. The
+        # prompt itself works in a notebook; it is only isatty() that is false.
+        key = os.environ.get('TRNPIKE_PRIVATE_KEY')
         if not key:
-            if not sys.stdin.isatty():
-                raise SystemExit('Set ZEROS_PRIVATE_KEY, or run on a terminal')
             import getpass
-            key = getpass.getpass('Mining wallet private key (hidden): ').strip()
+            try:
+                key = getpass.getpass('Mining wallet private key (hidden): ').strip()
+            except Exception as exc:
+                raise SystemExit(
+                    'Could not ask for the key here. Set TRNPIKE_PRIVATE_KEY instead.'
+                ) from exc
+        if not key:
+            raise SystemExit('No key given; nothing to mine with.')
         from eth_account import Account
         account = Account.from_key(key)
         address = account.address
