@@ -493,6 +493,11 @@ def main():
     # Counted rather than printed. A proof is found every few tens of
     # milliseconds, so a line each buried the one line that matters.
     stale, sent_count = 0, 0
+    # The seed a proof has already been spent on. A seed is a bill and a bill
+    # has one winner, so a second proof against the same one cannot mint - it
+    # can only revert and pay for the privilege. Eighty-two sends bought one
+    # bill and forty-five reverts before this existed.
+    spent_on = None
     job, seen_block, sent_nonce = None, 0, None
     last_poll, last_print = 0., time.monotonic()
     # Both are kept here rather than asked for at the moment of sending: the
@@ -584,6 +589,11 @@ def main():
                     if message_in.get('seed') not in (None, state['seed']):
                         stale += 1
                         continue
+                    if spent_on == state['seed']:
+                        # Already bid for this bill. Anything further is a
+                        # revert with a fee on it.
+                        stale += 1
+                        continue
                     value = int.from_bytes(cpu_digest(state['seed'], address, nonce), 'big')
                     if value >= target_for(message_in['bits']):
                         raise RuntimeError(f'GPU {message_in["device"]} returned a nonce the CPU rejects')
@@ -612,6 +622,7 @@ def main():
                             pending.append(dict(hash=sent, sent=time.monotonic()))
                             tx_nonce += 1
                             sent_count += 1
+                            spent_on = state['seed']
                         except Exception as exc:
                             try:
                                 tx_nonce = int(chain.call(
