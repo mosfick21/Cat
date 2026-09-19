@@ -346,20 +346,68 @@ def worker(device, seed_hex, address, jobs, results, stop, options):
         results.put(dict(type='ready', device=device, name=name, checked=checked,
                          kernel=f'{label} {threads}t x {grid}b', hps=hps))
 
-        job, loaded = None, None
+        # Two launches in the air at once. The card used to sit idle for the
+        # whole host half of every round - fill the flag, read it back, put the
+        # find on a queue - and at a 25 ms launch that gap is most of the loss
+        # between what the tuner measures and what the run sustains (0.62 GH/s
+        # against 0.55). While one stream is hashing the host works on the
+        # other, so the only thing waiting is this process.
+        #
+        # Each slot owns its buffers. The base lanes cannot be shared: the seed
+        # moves every second or two, and rewriting the lanes under a launch
+        # that is still reading them would corrupt it.
+        slots = []
+        for _ in range(2):
+            slots.append(dict(stream=cp.cuda.Stream(non_blocking=True),
+                              found=cp.zeros(1, dtype=cp.uint32),
+                              result=cp.zeros(64, dtype=cp.uint64),
+                              target=cp.zeros(4, dtype=cp.uint64),
+                              base=None, seed=None, prefix=None, bits=None,
+                              event=None, batch=0, began=0.))
+        job = None
         # The seed arrives with the job, not at start-up. It moves with every
         # bill, and restarting this process to carry a new one recompiled the
         # kernel each time - a second gone, on a road where a bill lasts about
         # one and a half. Rebuilding the lanes is twenty-five words uploaded.
         current = seed_hex
-        base = lanes_for(kind, current, prefix)
         batch = options['batch']
         counted, reported = 0, time.monotonic()
+        queue_order = []
+
+        def launch(slot):
+            nonlocal prefix
+            # The two uploads are done on the null stream and waited for. They
+            # happen when the seed moves, once a second or two, and cost
+            # microseconds; an asynchronous copy from a temporary host array is
+            # a way to hash the wrong thing for the sake of nothing.
+            if slot['seed'] != current or slot['prefix'] != prefix or slot['base'] is None:
+                slot['base'] = lanes_for(kind, current, prefix)
+                slot['seed'], slot['prefix'] = current, prefix
+            if slot['bits'] != job['bits']:
+                value = target_for(job['bits'])
+                slot['target'] = cp.asarray(np.asarray(
+                    [(value >> (192 - 64 * i)) & ((1 << 64) - 1) for i in range(4)],
+                    dtype=np.uint64))
+                slot['bits'] = job['bits']
+            cp.cuda.Stream.null.synchronize()
+            # The generated kernel counts nonces in 32 bits, so a launch is
+            # capped there; the high 192 bits are the prefix and never move
+            # inside one.
+            size = max(1 << 18, min(batch, 1 << 31))
+            start = secrets.randbits(31)
+            with slot['stream']:
+                slot['found'].fill(0)
+                search((grid,), (threads,), (slot['base'], slot['target'],
+                                             np.uint64(start), np.uint32(size),
+                                             slot['found'], slot['result']))
+                event = cp.cuda.Event()
+                event.record(slot['stream'])
+            slot['event'], slot['batch'], slot['began'] = event, size, time.perf_counter()
+            queue_order.append(slot)
+
         while not stop.is_set():
-            # Never wait for a job. Waiting .2 s for one while a launch also
-            # takes .2 s left this GPU idle half the time, and the printed rate
-            # counted the idle half - 0.44 GH/s was 0.88 GH/s at 50% duty.
-            # The job in hand stays valid until a newer one is there to take.
+            # Never wait for a job. The job in hand stays valid until a newer
+            # one is there to take.
             while True:
                 try: job = jobs.get_nowait()
                 except queue.Empty: break
@@ -369,40 +417,32 @@ def worker(device, seed_hex, address, jobs, results, stop, options):
             if job.get('seed') and job['seed'] != current:
                 current = job['seed']
                 prefix = secrets.randbits(192)
-                base = lanes_for(kind, current, prefix)
-            if loaded != job['bits']:
-                value = target_for(job['bits'])
-                target.set(np.asarray([(value >> (192 - 64 * i)) & ((1 << 64) - 1)
-                                       for i in range(4)], dtype=np.uint64))
-                loaded = job['bits']
-            found.fill(0)
-            began = time.perf_counter()
-            # The generated kernel counts nonces in 32 bits, so a launch is
-            # capped there; the high 192 bits are the prefix and never move
-            # inside one.
-            batch = min(batch, (1 << 31))
-            start = secrets.randbits(31)
-            search((grid,), (threads,),
-                   (base, target, np.uint64(start), np.uint32(batch), found, result))
-            cp.cuda.Stream.null.synchronize()
-            elapsed = time.perf_counter() - began
-            counted += batch
-            hits = int(found.get()[0])
+            for slot in slots:
+                if slot['event'] is None:
+                    launch(slot)
+            slot = queue_order.pop(0)
+            slot['event'].synchronize()
+            elapsed = time.perf_counter() - slot['began']
+            counted += slot['batch']
+            hits = int(slot['found'].get()[0])
+            slot['event'] = None
             if hits:
-                low = int(result.get()[0])
+                low = int(slot['result'].get()[0])
                 results.put(dict(type='found', device=device,
-                                 nonce=((prefix << 64) | low) & ((1 << 256) - 1),
-                                 bits=job['bits'], seed=current))
+                                 nonce=((slot['prefix'] << 64) | low) & ((1 << 256) - 1),
+                                 bits=slot['bits'], seed=slot['seed']))
                 # A fresh prefix after every win, so two proofs never share a
                 # search space and the next one is not a repeat of this one.
-                prefix = secrets.randbits(192)
-                base = lanes_for(kind, current, prefix)
+                if slot['seed'] == current:
+                    prefix = secrets.randbits(192)
             now = time.monotonic()
             if now - reported >= 10:
                 results.put(dict(type='rate', device=device, hps=counted / (now - reported)))
                 counted, reported = 0, now
+            # Two launches share the wall clock, so each one aims at twice the
+            # batch the target duration asks for.
             batch = max(1 << 18, min(1 << 31, int(batch * min(
-                2, max(.5, options['batch_ms'] / 1000 / max(elapsed, 1e-6))))))
+                2, max(.5, 2 * options['batch_ms'] / 1000 / max(elapsed, 1e-6))))))
     except BaseException as exc:
         results.put(dict(type='error', device=device, error=f'{type(exc).__name__}: {str(exc)[:200]}'))
 
