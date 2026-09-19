@@ -121,18 +121,30 @@ class Chain:
                 last = exc
         raise last
 
-    def state(self):
+    def constants(self):
+        """startBits and openAt: read once. Neither moves, and a round trip
+        each poll for a constant is a round trip the race pays for."""
+        start_bits = int(self.call('eth_call', [{'to': CONTRACT, 'data': SELECTOR['startBits']}, 'latest']), 16)
+        opens_at = int(self.call('eth_call', [{'to': CONTRACT, 'data': SELECTOR['openAt']}, 'latest']), 16)
+        return start_bits, opens_at
+
+    def state(self, start_bits, opens_at):
         """Seed, the next bill, the bar it must beat, and the block read at.
+
+        Three calls, not five: a bill lasts about a second and a half on a
+        live road, so this runs several times a second and everything in it is
+        paid for at that rate. startBits and openAt are constants and are read
+        once, by constants().
 
         The block rides along because endpoints do not share a tip - measured,
         one ran ten blocks behind another - and reads rotate, so without it a
         poll could walk the target backwards onto a bar already gone.
         """
-        names = ['seed', 'next', 'startBits', 'openAt']
-        calls = [dict(jsonrpc='2.0', id=i, method='eth_call',
-                      params=[{'to': CONTRACT, 'data': SELECTOR[n]}, 'latest'])
-                 for i, n in enumerate(names)]
-        calls.append(dict(jsonrpc='2.0', id=len(names), method='eth_blockNumber', params=[]))
+        calls = [dict(jsonrpc='2.0', id=0, method='eth_call',
+                      params=[{'to': CONTRACT, 'data': SELECTOR['seed']}, 'latest']),
+                 dict(jsonrpc='2.0', id=1, method='eth_call',
+                      params=[{'to': CONTRACT, 'data': SELECTOR['next']}, 'latest']),
+                 dict(jsonrpc='2.0', id=2, method='eth_blockNumber', params=[])]
         last = None
         for _ in range(len(self.urls)):
             url = self.urls[self.index % len(self.urls)]
@@ -145,8 +157,6 @@ class Chain:
                 if any('error' in r for r in rows):
                     raise RuntimeError('state read refused')
                 nxt = int(rows[1]['result'], 16)
-                start_bits = int(rows[2]['result'], 16)
-                opens_at = int(rows[3]['result'], 16)
                 return dict(seed=rows[0]['result'],
                             next=nxt,
                             start_bits=start_bits,
@@ -155,7 +165,7 @@ class Chain:
                             supply=SUPPLY,
                             open=time.time() >= opens_at and nxt < SUPPLY,
                             opens_at=opens_at,
-                            block=int(rows[4]['result'], 16), endpoint=url)
+                            block=int(rows[2]['result'], 16), endpoint=url)
             except Exception as exc:
                 last = exc
         raise last
@@ -422,7 +432,17 @@ def main():
     parser.add_argument('--rpc', action='append', help='repeat for more endpoints')
     parser.add_argument('--batch-ms', type=float, default=200, help='target GPU launch duration')
     parser.add_argument('--blocks', type=int, default=2048, help='thread blocks per launch')
-    parser.add_argument('--poll', type=float, default=2., help='seconds between chain reads')
+    parser.add_argument('--poll', type=float, default=.2,
+                        help='seconds between chain reads. A bill lasts about a second and a half'
+                             ' and the work in flight dies with it, so this is the whole race:'
+                             ' at 2 s the cards spent most of every bill on a seed already gone.')
+    parser.add_argument('--gas-multiple', type=float, default=2.,
+                        help='multiplier on the base fee. Robinhood orders by the tip 81-87%% of'
+                             ' the time under load, and the mint costs a fraction of a cent.')
+    parser.add_argument('--precheck', action='store_true',
+                        help='ask eth_call whether the mint would revert before paying for it.'
+                             ' Off by default: it is a round trip on the send path, which is the'
+                             ' race, and a lost race costs about 1.5e-5 ETH in gas.')
     parser.add_argument('--self-test', action='store_true', help='check the kernel and exit; no key')
     parser.add_argument('--rehearse', action='store_true',
                         help='run the whole loop on the CPU at a trivial bar and send nothing:'
@@ -463,7 +483,8 @@ def main():
 
     check_selectors()
     chain = Chain(args.rpc or RPCS)
-    state = chain.state()
+    start_bits, opens_at = chain.constants()
+    state = chain.state(start_bits, opens_at)
     if int(state['seed'], 16) == 0:
         raise SystemExit('The seed is not revealed yet; there is nothing to mine.')
     log(f'bills {state["next"]}/{SUPPLY} | work {state["bits"]} bits'
@@ -522,49 +543,71 @@ def main():
     # Both are kept here rather than asked for at the moment of sending: the
     # send path is the race, and a round trip on it loses the bill.
     tx_nonce = int(chain.call('eth_getTransactionCount', [address, 'pending']), 16)
-    gas_price = int(int(chain.call('eth_gasPrice', []), 16) * 1.2) + 1
+    gas_price = int(int(chain.call('eth_gasPrice', []), 16) * args.gas_multiple) + 1
+    # The state read runs several times a second now. These two do not have to:
+    # the base fee moves slowly and a receipt is not worth a round trip at the
+    # pace of the race.
+    last_gas, last_receipts = time.monotonic(), 0.
     try:
         while True:
             now = time.monotonic()
             if now - last_poll >= args.poll:
                 last_poll = now
                 try:
-                    fresh = chain.state()
+                    fresh = chain.state(start_bits, opens_at)
                 except Exception as exc:
                     log(f'state read {type(exc).__name__}; keeping the last job')
                     fresh = None
                 fresh, seen_block = accept_state(fresh, seen_block)
 
-                for entry in list(pending):
-                    try:
-                        receipt = chain.call('eth_getTransactionReceipt', [entry['hash']])
-                    except Exception:
-                        continue
-                    if not receipt:
-                        if now - entry['sent'] > 120:
-                            pending.remove(entry)
-                            log(f'no receipt for {entry["hash"][:14]}... after two minutes')
-                        continue
-                    pending.remove(entry)
-                    if int(receipt['status'], 16) == 1:
-                        mined += 1
-                        log(f'MINTED #{mined} -> {EXPLORER}{entry["hash"]}')
-                    else:
-                        lost += 1
-                        pass
+                if pending and now - last_receipts >= 1.:
+                    last_receipts = now
+                    for entry in list(pending):
+                        try:
+                            receipt = chain.call('eth_getTransactionReceipt', [entry['hash']])
+                        except Exception:
+                            continue
+                        if not receipt:
+                            if now - entry['sent'] > 120:
+                                pending.remove(entry)
+                                log(f'no receipt for {entry["hash"][:14]}... after two minutes')
+                            continue
+                        pending.remove(entry)
+                        if int(receipt['status'], 16) == 1:
+                            mined += 1
+                            log(f'MINTED #{mined} -> {EXPLORER}{entry["hash"]}')
+                        else:
+                            lost += 1
+                            # A revert on a bill we bid for and did not get. The
+                            # seed has moved with it, so there is nothing to
+                            # retry; but if it has not - the revert was ours
+                            # alone - the bill is still there to be won and the
+                            # lock on this seed comes off.
+                            if spent_on == state['seed'] and entry.get('seed') == state['seed']:
+                                spent_on = None
                 if fresh:
-                    try:
-                        gas_price = int(int(chain.call('eth_gasPrice', []), 16) * 1.2) + 1
-                    except Exception:
-                        pass
+                    if now - last_gas >= 5.:
+                        last_gas = now
+                        try:
+                            gas_price = int(int(chain.call('eth_gasPrice', []), 16) * args.gas_multiple) + 1
+                        except Exception:
+                            pass
                     if fresh['seed'] != state['seed']:
                         # Somebody minted, so the seed moved and every nonce in
                         # flight is worthless. Pick the new one up and carry on
                         # rather than stopping: on a live road this happens
                         # every few seconds, and stopping means mining once.
 
+                        #
+                        # What is *not* cleared here is `pending`. It was, and
+                        # the seed moves the instant a bill is taken - our own
+                        # win moves it too, so every mint this file ever landed
+                        # had its receipt thrown away one poll later and the
+                        # run reported "minted 0" while the bills sat in the
+                        # wallet. The nonces in flight are worthless; their
+                        # receipts are the only word we get.
                         state = fresh
-                        pending.clear()
+                        spent_on = None
                         job = dict(bits=fresh['bits'], seed=fresh['seed'])
                         dispatch(job)
                         continue
@@ -631,23 +674,22 @@ def main():
                         # counted locally, and the gas price is refreshed on
                         # the poll like everything else.
                         data = SELECTOR['mine'] + f'{nonce:064x}'
-                        # Asked before it is paid for. The contract answers
-                        # eth_call from this address for nothing, and a call
-                        # that reverts is a transaction that would have
-                        # reverted - the bill already taken, the proof already
-                        # spent, the bar moved. The site's own miner does the
-                        # same thing for the same reason.
-                        #
-                        # It cannot make a revert impossible: between this
-                        # answer and the block that includes us, somebody
-                        # else's mine() can still land first. It makes it rare,
-                        # which is the most a public chain allows.
-                        try:
-                            chain.call('eth_call', [{'from': address, 'to': CONTRACT,
-                                                     'data': data}, 'latest'])
-                        except Exception:
-                            refused += 1
-                            continue
+                        # --precheck asks the chain whether this would revert
+                        # before a fee is paid on it. It is off by default,
+                        # because it is a round trip - 26 ms measured on the
+                        # chain's own RPC - on the one path that is the race,
+                        # and it cannot make a revert impossible anyway:
+                        # between its answer and the block that includes us,
+                        # somebody else's mine() can still land first. A lost
+                        # race costs 196,608 gas at 0.075 gwei, about 1.5e-5
+                        # ETH. Arriving 26 ms later costs the bill.
+                        if args.precheck:
+                            try:
+                                chain.call('eth_call', [{'from': address, 'to': CONTRACT,
+                                                         'data': data}, 'latest'])
+                            except Exception:
+                                refused += 1
+                                continue
                         tx = {'chainId': CHAIN_ID, 'to': CONTRACT, 'value': 0, 'gas': MINT_GAS,
                               'gasPrice': gas_price,
                               'nonce': tx_nonce,
@@ -656,7 +698,8 @@ def main():
                         sent = '0x' + signed.hash.hex().removeprefix('0x')
                         try:
                             chain.broadcast('0x' + signed.raw_transaction.hex())
-                            pending.append(dict(hash=sent, sent=time.monotonic()))
+                            pending.append(dict(hash=sent, sent=time.monotonic(),
+                                                seed=state['seed']))
                             tx_nonce += 1
                             sent_count += 1
                             spent_on = state['seed']

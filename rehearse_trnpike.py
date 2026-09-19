@@ -17,12 +17,18 @@ bad = lambda m: (print("  FAIL", m), sys.exit(1))
 
 acct = Account.from_key(secrets.token_bytes(32))
 chain = t.Chain(t.RPCS)
-state = chain.state()
+start_bits, opens_at = chain.constants()
+state = chain.state(start_bits, opens_at)
 print(f"live: bill {state['next']}, {state['bits']} bits, seed {state['seed'][:12]}…\n")
 
 print("1. the selectors the send path reaches for")
 t.check_selectors()
 ok("every selector resolves (the 'mint' vs 'mine' crash)")
+
+print("\n1b. the hot read carries no constant with it")
+if state['start_bits'] != start_bits: bad("startBits did not survive the slim read")
+if 'seed' not in state or 'block' not in state: bad("the hot read lost a field")
+ok("seed, next and the block; startBits and openAt read once")
 
 print("\n2. find a real nonce on the CPU at a trivial bar, and verify it")
 BITS = 12
