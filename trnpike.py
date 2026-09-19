@@ -213,92 +213,19 @@ def accept_state(fresh, seen_block):
     return fresh, fresh['block']
 
 
-# Keccak-f[1600]. The message is 84 bytes, so one block: lanes 0-3 carry the
-# seed, 4-6 the address and the top of the nonce, and only the low 64 bits of
-# the nonce move - the halves of lanes 9 and 10 written below.
-SOURCE = r'''
-typedef unsigned long long u64;
-__constant__ u64 RC[24]={
-0x0000000000000001ULL,0x0000000000008082ULL,0x800000000000808aULL,0x8000000080008000ULL,
-0x000000000000808bULL,0x0000000080000001ULL,0x8000000080008081ULL,0x8000000000008009ULL,
-0x000000000000008aULL,0x0000000000000088ULL,0x0000000080008009ULL,0x000000008000000aULL,
-0x000000008000808bULL,0x800000000000008bULL,0x8000000000008089ULL,0x8000000000008003ULL,
-0x8000000000008002ULL,0x8000000000000080ULL,0x000000000000800aULL,0x800000008000000aULL,
-0x8000000080008081ULL,0x8000000000008080ULL,0x0000000080000001ULL,0x8000000080008008ULL};
-__constant__ int RHO[25]={0,1,62,28,27,36,44,6,55,20,3,10,43,25,39,41,45,15,21,8,18,2,61,56,14};
+# The kernel is generated, never written here. kernels.py prints a fully
+# unrolled Keccak with one named register per lane; the hand-written one this
+# replaces kept `u64 b[25]` inside the round loop, which spills to local memory
+# - the same mistake that once left six RTX 5090s at 1.78 GH/s, under a third
+# of one card. kernels.source takes the lane pair the nonce's low 64 bits sit
+# in, and for a message that opens with a 32-byte seed that pair is (9, 10):
+# bytes 76-79 are the high half of lane 9, bytes 80-83 the low half of lane 10.
+NONCE_LANES = (9, 10)
 
-__device__ __forceinline__ u64 rol(u64 x,int n){ return n ? ((x<<n)|(x>>(64-n))) : x; }
-__device__ __forceinline__ unsigned int bsw32(unsigned int x){
-  return (x>>24)|((x>>8)&0xff00u)|((x<<8)&0xff0000u)|(x<<24);
-}
-__device__ __forceinline__ u64 bsw64(u64 x){
-  x=((x&0x00ff00ff00ff00ffULL)<<8)|((x>>8)&0x00ff00ff00ff00ffULL);
-  x=((x&0x0000ffff0000ffffULL)<<16)|((x>>16)&0x0000ffff0000ffffULL);
-  return (x<<32)|(x>>32);
-}
-
-__device__ __forceinline__ void digest(const u64* base, u64 nonce, u64* out){
-  u64 s[25];
-  #pragma unroll
-  for(int i=0;i<17;i++) s[i]=base[i];
-  #pragma unroll
-  for(int i=17;i<25;i++) s[i]=0ULL;
-  // Bytes 76..79 are the nonce's high word, 80..83 its low word, both big
-  // endian inside little-endian lanes.
-  unsigned int hi=(unsigned int)(nonce>>32), lo=(unsigned int)nonce;
-  s[9]=(s[9]&0x00000000ffffffffULL)|((u64)bsw32(hi)<<32);
-  s[10]=(s[10]&0xffffffff00000000ULL)|(u64)bsw32(lo);
-  for(int r=0;r<24;r++){
-    u64 c0=s[0]^s[5]^s[10]^s[15]^s[20];
-    u64 c1=s[1]^s[6]^s[11]^s[16]^s[21];
-    u64 c2=s[2]^s[7]^s[12]^s[17]^s[22];
-    u64 c3=s[3]^s[8]^s[13]^s[18]^s[23];
-    u64 c4=s[4]^s[9]^s[14]^s[19]^s[24];
-    u64 d0=c4^rol(c1,1), d1=c0^rol(c2,1), d2=c1^rol(c3,1), d3=c2^rol(c4,1), d4=c3^rol(c0,1);
-    u64 b[25];
-    #pragma unroll
-    for(int y=0;y<5;y++){
-      #pragma unroll
-      for(int x=0;x<5;x++){
-        u64 d = x==0?d0:(x==1?d1:(x==2?d2:(x==3?d3:d4)));
-        b[y+5*((2*x+3*y)%5)] = rol(s[x+5*y]^d, RHO[x+5*y]);
-      }
-    }
-    #pragma unroll
-    for(int y=0;y<5;y++){
-      #pragma unroll
-      for(int x=0;x<5;x++) s[x+5*y]=b[x+5*y]^((~b[(x+1)%5+5*y])&b[(x+2)%5+5*y]);
-    }
-    s[0]^=RC[r];
-  }
-  // The digest read big-endian: lane 0 holds its most significant bytes.
-  #pragma unroll
-  for(int i=0;i<4;i++) out[i]=bsw64(s[i]);
-}
-
-extern "C" __global__ void probe(const u64* base, u64 start, unsigned int count, u64* out){
-  unsigned int i=blockIdx.x*blockDim.x+threadIdx.x;
-  if(i<count) digest(base,start+i,out+4*i);
-}
-
-extern "C" __global__ void search(const u64* base, const u64* target, u64 start, u64 count,
-                                  unsigned int* found, u64* result){
-  u64 stride=(u64)gridDim.x*blockDim.x;
-  // Reading *found before every hash put a dependent global load on the
-  // critical path of each one. A launch is sized to ~200 ms, so giving up
-  // 255 hashes late costs microseconds and buys back the load.
-  unsigned int tick=0;
-  for(u64 i=(u64)blockIdx.x*blockDim.x+threadIdx.x;i<count;i+=stride){
-    if((tick++ & 255u)==0u && *found) return;
-    u64 h[4]; u64 nonce=start+i;
-    digest(base,nonce,h);
-    bool pass=false;
-    #pragma unroll
-    for(int k=0;k<4;k++){ if(h[k]<target[k]){pass=true;break;} if(h[k]>target[k]) break; }
-    if(pass){ if(atomicExch(found,1u)==0u) *result=nonce; return; }
-  }
-}
-'''
+# The three the cards are raced over. Which one wins is a property of the card,
+# not of the hash - a T4 took interleaved32, and a fixed choice left the 5090s
+# at 16.9 GH/s - so it is measured on the card every run.
+VARIANTS = (('scalar64', 1), ('interleaved32', 1), ('interleaved32', 2))
 
 
 def message(seed_hex, address, nonce):
@@ -344,39 +271,87 @@ def worker(device, seed_hex, address, jobs, results, stop, options):
     try:
         import cupy as cp
         import numpy as np
+        from kernels import source
+        from core import base32
         cp.cuda.Device(device).use()
-        name = cp.cuda.runtime.getDeviceProperties(device)['name']
+        props = cp.cuda.runtime.getDeviceProperties(device)
+        name = props['name']
         name = name.decode() if isinstance(name, bytes) else name
-        module = cp.RawModule(code=SOURCE, options=('--std=c++11',))
-        probe, search = module.get_function('probe'), module.get_function('search')
-        results.put(dict(type='status', device=device, message='compiled on ' + name))
+        sms = int(props['multiProcessorCount'])
 
-        # Nothing real is hashed until this GPU reproduces a digest the CPU
+        def build(kind, unroll):
+            module = cp.RawModule(code=source(kind, unroll, NONCE_LANES),
+                                  options=('--std=c++11',))
+            return (module, module.get_function('search_' + kind),
+                    module.get_function('probe_' + kind), kind)
+
+        built = []
+        for kind, unroll in VARIANTS:
+            try:
+                built.append((f'{kind}_u{unroll}' if unroll > 1 else kind, build(kind, unroll)))
+            except Exception as exc:
+                results.put(dict(type='status', device=device,
+                                 message=f'{kind} would not compile: {type(exc).__name__}'))
+        if not built:
+            raise RuntimeError('no kernel compiled on this card')
+        results.put(dict(type='status', device=device,
+                         message=f'{len(built)} kernels compiled on {name} ({sms} SMs)'))
+
+        def lanes_for(kind, seed, prefix):
+            words = base_lanes(seed, address, prefix)
+            return (cp.asarray(np.asarray(base32(words), dtype=np.uint32))
+                    if kind.startswith('interleaved32')
+                    else cp.asarray(np.asarray(words, dtype=np.uint64)))
+
+        # Nothing real is hashed until every kernel reproduces a digest the CPU
         # agrees with, on the very layout the contract accepted.
         prefix = secrets.randbits(192)
-        base = cp.asarray(np.asarray(base_lanes(seed_hex, address, prefix), dtype=np.uint64))
-        out = cp.zeros(8 * 4, dtype=cp.uint64)
-        start = secrets.randbits(50)
-        probe((1,), (8,), (base, np.uint64(start), np.uint32(8), out))
-        rows = out.get().reshape(8, 4)
         checked = 0
-        for offset, row in enumerate(rows):
-            got = b''.join(int(x).to_bytes(8, 'big') for x in row)
-            nonce = ((prefix << 64) | ((start + offset) & 0xFFFFFFFFFFFFFFFF)) & ((1 << 256) - 1)
-            if got != cpu_digest(seed_hex, address, nonce):
-                raise RuntimeError('GPU Keccak disagrees with the CPU')
-            checked += 1
-        results.put(dict(type='ready', device=device, name=name, checked=checked))
+        for label, (_, _, probe, kind) in built:
+            base = lanes_for(kind, seed_hex, prefix)
+            out = cp.zeros(8 * 4, dtype=cp.uint64)
+            start = secrets.randbits(50)
+            probe((1,), (8,), (base, np.uint64(start), np.uint32(8), out))
+            for offset, row in enumerate(out.get().reshape(8, 4)):
+                got = b''.join(int(x).to_bytes(8, 'big') for x in row)
+                nonce = ((prefix << 64) | ((start + offset) & 0xFFFFFFFFFFFFFFFF)) & ((1 << 256) - 1)
+                if got != cpu_digest(seed_hex, address, nonce):
+                    raise RuntimeError(f'{label}: GPU Keccak disagrees with the CPU')
+                checked += 1
 
+        # Raced on the card, not chosen for it. A T4 is fastest on
+        # interleaved32 and a 5090 is not, and picking one by hand cost the
+        # 5090s more than half their hashes.
         found = cp.zeros(1, dtype=cp.uint32)
-        result = cp.zeros(1, dtype=cp.uint64)
+        result = cp.zeros(64, dtype=cp.uint64)
         target = cp.zeros(4, dtype=cp.uint64)
+        target.set(np.asarray([0, 0, 0, 0], dtype=np.uint64))
+        best, scores = None, []
+        for label, (_, search, _, kind) in built:
+            base = lanes_for(kind, seed_hex, prefix)
+            for threads in (128, 256):
+                for per_sm in (4, 8, 16):
+                    grid = sms * per_sm
+                    count = grid * threads * 64
+                    found.fill(0)
+                    began = time.perf_counter()
+                    search((grid,), (threads,),
+                           (base, target, np.uint64(0), np.uint32(count), found, result))
+                    cp.cuda.Stream.null.synchronize()
+                    hps = count / max(time.perf_counter() - began, 1e-6)
+                    scores.append((hps, label, kind, search, threads, grid))
+        best = max(scores)
+        hps, label, kind, search, threads, grid = best
+        results.put(dict(type='ready', device=device, name=name, checked=checked,
+                         kernel=f'{label} {threads}t x {grid}b', hps=hps))
+
         job, loaded = None, None
         # The seed arrives with the job, not at start-up. It moves with every
         # bill, and restarting this process to carry a new one recompiled the
         # kernel each time - a second gone, on a road where a bill lasts about
         # one and a half. Rebuilding the lanes is twenty-five words uploaded.
         current = seed_hex
+        base = lanes_for(kind, current, prefix)
         batch = options['batch']
         counted, reported = 0, time.monotonic()
         while not stop.is_set():
@@ -393,7 +368,7 @@ def worker(device, seed_hex, address, jobs, results, stop, options):
             if job.get('seed') and job['seed'] != current:
                 current = job['seed']
                 prefix = secrets.randbits(192)
-                base = cp.asarray(np.asarray(base_lanes(current, address, prefix), dtype=np.uint64))
+                base = lanes_for(kind, current, prefix)
             if loaded != job['bits']:
                 value = target_for(job['bits'])
                 target.set(np.asarray([(value >> (192 - 64 * i)) & ((1 << 64) - 1)
@@ -401,13 +376,18 @@ def worker(device, seed_hex, address, jobs, results, stop, options):
                 loaded = job['bits']
             found.fill(0)
             began = time.perf_counter()
-            start = secrets.randbits(63)
-            search((options['blocks'],), (256,),
-                   (base, target, np.uint64(start), np.uint64(batch), found, result))
+            # The generated kernel counts nonces in 32 bits, so a launch is
+            # capped there; the high 192 bits are the prefix and never move
+            # inside one.
+            batch = min(batch, (1 << 31))
+            start = secrets.randbits(31)
+            search((grid,), (threads,),
+                   (base, target, np.uint64(start), np.uint32(batch), found, result))
             cp.cuda.Stream.null.synchronize()
             elapsed = time.perf_counter() - began
             counted += batch
-            if int(found.get()[0]):
+            hits = int(found.get()[0])
+            if hits:
                 low = int(result.get()[0])
                 results.put(dict(type='found', device=device,
                                  nonce=((prefix << 64) | low) & ((1 << 256) - 1),
@@ -415,12 +395,12 @@ def worker(device, seed_hex, address, jobs, results, stop, options):
                 # A fresh prefix after every win, so two proofs never share a
                 # search space and the next one is not a repeat of this one.
                 prefix = secrets.randbits(192)
-                base = cp.asarray(np.asarray(base_lanes(current, address, prefix), dtype=np.uint64))
+                base = lanes_for(kind, current, prefix)
             now = time.monotonic()
             if now - reported >= 10:
                 results.put(dict(type='rate', device=device, hps=counted / (now - reported)))
                 counted, reported = 0, now
-            batch = max(1 << 18, min(1 << 30, int(batch * min(
+            batch = max(1 << 18, min(1 << 31, int(batch * min(
                 2, max(.5, options['batch_ms'] / 1000 / max(elapsed, 1e-6))))))
     except BaseException as exc:
         results.put(dict(type='error', device=device, error=f'{type(exc).__name__}: {str(exc)[:200]}'))
@@ -633,7 +613,9 @@ def main():
                 if kind == 'ready':
                     ready.add(message_in['device'])
                     log(f'gpu{message_in["device"]}: {message_in["name"]},'
-                        f' {message_in["checked"]} digests matched the CPU')
+                        f' {message_in["checked"]} digests matched the CPU;'
+                        f' fastest kernel {message_in["kernel"]}'
+                        f' at {message_in["hps"]/1e9:.2f} GH/s')
                     if args.self_test and len(ready) == len(devices):
                         log('kernel correct on every GPU. No key was asked for, nothing was sent.')
                         return

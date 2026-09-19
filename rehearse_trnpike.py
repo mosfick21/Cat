@@ -71,4 +71,30 @@ if t.bits_for(22, 384) != 23: bad("384 bills does not add a bit")
 if t.target_for(23) != 1 << 233: bad("target is not 1 << (256 - bits)")
 ok("bits = startBits + next//384, target = 1 << (256 - bits)")
 
+print("\n7. the generated kernels, checked on this CPU (no card needed)")
+import ctypes, subprocess, tempfile, os
+from kernels import source
+from core import base32
+seed = state['seed']; prefix = secrets.randbits(192)
+words = t.base_lanes(seed, acct.address, prefix)
+if t.NONCE_LANES != (9, 10): bad("the nonce lane pair is not the one this layout has")
+tmp = tempfile.mkdtemp()
+for kind, unroll in t.VARIANTS:
+    cpp = os.path.join(tmp, f'{kind}{unroll}.cpp'); so = os.path.join(tmp, f'{kind}{unroll}.so')
+    open(cpp, 'w').write('#define HOST_TEST\n' + source(kind, unroll, t.NONCE_LANES))
+    r = subprocess.run(['g++', '-O2', '-shared', '-fPIC', '-o', so, cpp], capture_output=True, text=True)
+    if r.returncode: bad(f"{kind} u{unroll} does not compile: {r.stderr[:200]}")
+    lib = ctypes.CDLL(so); fn = getattr(lib, 'host_' + kind)
+    arr = ((ctypes.c_uint64 * 17)(*words) if kind == 'scalar64'
+           else (ctypes.c_uint32 * 34)(*base32(words)))
+    out = (ctypes.c_uint64 * 4)()
+    fn.argtypes = [ctypes.POINTER(type(arr)._type_), ctypes.c_uint64, ctypes.POINTER(ctypes.c_uint64)]
+    for _ in range(4):
+        low = secrets.randbits(64)
+        fn(arr, ctypes.c_uint64(low), out)
+        got = b''.join(int(out[i]).to_bytes(8, 'big') for i in range(4))
+        if got != t.cpu_digest(seed, acct.address, ((prefix << 64) | low) & ((1 << 256) - 1)):
+            bad(f"{kind} u{unroll} disagrees with the CPU on the contract's own layout")
+    ok(f"{kind} u{unroll} matches the CPU, 4 digests")
+
 print("\nALL PASS - nothing was sent")
