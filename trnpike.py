@@ -346,6 +346,11 @@ def worker(device, seed_hex, address, jobs, results, stop, options):
         result = cp.zeros(1, dtype=cp.uint64)
         target = cp.zeros(4, dtype=cp.uint64)
         job, loaded = None, None
+        # The seed arrives with the job, not at start-up. It moves with every
+        # bill, and restarting this process to carry a new one recompiled the
+        # kernel each time - a second gone, on a road where a bill lasts about
+        # one and a half. Rebuilding the lanes is twenty-five words uploaded.
+        current = seed_hex
         batch = options['batch']
         counted, reported = 0, time.monotonic()
         while not stop.is_set():
@@ -358,6 +363,10 @@ def worker(device, seed_hex, address, jobs, results, stop, options):
                 pass
             if job is None:
                 continue
+            if job.get('seed') and job['seed'] != current:
+                current = job['seed']
+                prefix = secrets.randbits(192)
+                base = cp.asarray(np.asarray(base_lanes(current, address, prefix), dtype=np.uint64))
             if loaded != job['bits']:
                 value = target_for(job['bits'])
                 target.set(np.asarray([(value >> (192 - 64 * i)) & ((1 << 64) - 1)
@@ -375,11 +384,11 @@ def worker(device, seed_hex, address, jobs, results, stop, options):
                 low = int(result.get()[0])
                 results.put(dict(type='found', device=device,
                                  nonce=((prefix << 64) | low) & ((1 << 256) - 1),
-                                 bits=job['bits'], seed=seed_hex))
+                                 bits=job['bits'], seed=current))
                 # A fresh prefix after every win, so two proofs never share a
                 # search space and the next one is not a repeat of this one.
                 prefix = secrets.randbits(192)
-                base = cp.asarray(np.asarray(base_lanes(seed_hex, address, prefix), dtype=np.uint64))
+                base = cp.asarray(np.asarray(base_lanes(current, address, prefix), dtype=np.uint64))
             now = time.monotonic()
             if now - reported >= 10:
                 results.put(dict(type='rate', device=device, hps=counted / (now - reported)))
@@ -461,27 +470,15 @@ def main():
     options = dict(batch=1 << 22, batch_ms=args.batch_ms, blocks=args.blocks)
     queues, workers = {}, {}
 
-    def start_workers(seed_hex):
-        """Put every card to work on this seed, replacing whatever went before.
-
-        The seed changes with every bill here - it is the previous winner's
-        proof - so a mint by anybody invalidates the work in flight. ZEROS,
-        which this was rewritten from, had a fixed seed and could simply stop
-        and tell the operator to restart; doing that on trnpike means stopping
-        every time somebody else mints, which on a live road is constantly.
-        """
-        stop.clear()
-        for device in devices:
-            old = workers.get(device)
-            if old is not None and old.is_alive():
-                old.terminate()
-                old.join(timeout=2)
-            queues[device] = context.Queue(maxsize=2)
-            workers[device] = context.Process(target=worker, daemon=True,
-                args=(device, seed_hex, address, queues[device], results, stop, options))
-            workers[device].start()
-
-    start_workers(state['seed'])
+    # Started once. The seed moves with every bill and travels in the job;
+    # restarting these to carry a new one recompiled the kernel each time,
+    # which cost about a second while a bill lasts about one and a half. Every
+    # proof was late for exactly that reason.
+    for device in devices:
+        queues[device] = context.Queue(maxsize=2)
+        workers[device] = context.Process(target=worker, daemon=True,
+            args=(device, state['seed'], address, queues[device], results, stop, options))
+        workers[device].start()
 
     def dispatch(job):
         for q in queues.values():
@@ -535,11 +532,9 @@ def main():
                         log(f'bill {fresh["next"]} went to someone else;'
                             f' new seed, {fresh["bits"]} bits, working again')
                         state = fresh
-                        job = None
                         pending.clear()
                         tx_nonce = None
-                        start_workers(fresh['seed'])
-                        job = dict(bits=fresh['bits'])
+                        job = dict(bits=fresh['bits'], seed=fresh['seed'])
                         dispatch(job)
                         continue
                     if fresh['minted'] >= fresh['supply']:
@@ -547,7 +542,7 @@ def main():
                             f' Stopping; minted {mined}, lost {lost}.')
                         return
                     if job is None or fresh['bits'] != job['bits']:
-                        job = dict(bits=fresh['bits'])
+                        job = dict(bits=fresh['bits'], seed=fresh['seed'])
                         dispatch(job)
 
             try:
@@ -589,6 +584,22 @@ def main():
                     elif args.self_test:
                         log('self-test solution found; nothing sent')
                     else:
+                        # The seed, once more, from the chain. A proof is only
+                        # worth gas while the bill it was found for is still
+                        # unclaimed, and bills go about every second and a half
+                        # here - so between finding one and spending on it,
+                        # somebody else may already have taken it. Every
+                        # "below the bar: the target moved first" in the log
+                        # was gas paid to be told that. One read costs thirty
+                        # milliseconds and refuses the transaction instead.
+                        try:
+                            live = chain.call('eth_call',
+                                              [{'to': CONTRACT, 'data': SELECTOR['seed']}, 'latest'])
+                        except Exception:
+                            live = state['seed']
+                        if live != state['seed']:
+                            log('the bill went while this proof was in hand; nothing sent')
+                            continue
                         if tx_nonce is None:
                             tx_nonce = int(chain.call('eth_getTransactionCount',
                                                       [address, 'pending']), 16)
