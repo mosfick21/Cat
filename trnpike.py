@@ -54,6 +54,19 @@ BILLS_PER_BIT = 384
 MINT_GAS = 0x30000
 
 
+def check_selectors():
+    """Every selector the run reaches for must exist before it is reached.
+
+    It did not: the send still asked for SELECTOR['mint'] after the table had
+    been renamed to 'mine', and nothing found out until two T4s had compiled,
+    matched the CPU, found a proof and gone to spend it. A KeyError on the one
+    line that sends is the most expensive place in the file to put a typo.
+    """
+    for name in ('seed', 'next', 'startBits', 'openAt', 'mine'):
+        if name not in SELECTOR:
+            raise SystemExit(f'selector {name!r} is missing from SELECTOR')
+
+
 def log(message):
     print(time.strftime('%H:%M:%S'), message, flush=True)
 
@@ -401,6 +414,7 @@ def main():
         del key
         log('mining for ' + address)
 
+    check_selectors()
     chain = Chain(args.rpc or RPCS)
     state = chain.state()
     if int(state['seed'], 16) == 0:
@@ -522,7 +536,7 @@ def main():
                         tx = {'chainId': CHAIN_ID, 'to': CONTRACT, 'value': 0, 'gas': MINT_GAS,
                               'gasPrice': int(int(chain.call('eth_gasPrice', []), 16) * 1.2) + 1,
                               'nonce': tx_nonce,
-                              'data': SELECTOR['mint'] + f'{nonce:064x}'}
+                              'data': SELECTOR['mine'] + f'{nonce:064x}'}
                         signed = account.sign_transaction(tx)
                         sent = '0x' + signed.hash.hex().removeprefix('0x')
                         try:
