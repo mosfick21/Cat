@@ -375,7 +375,7 @@ def worker(device, seed_hex, address, jobs, results, stop, options):
                 low = int(result.get()[0])
                 results.put(dict(type='found', device=device,
                                  nonce=((prefix << 64) | low) & ((1 << 256) - 1),
-                                 bits=job['bits']))
+                                 bits=job['bits'], seed=seed_hex))
                 # A fresh prefix after every win, so two proofs never share a
                 # search space and the next one is not a repeat of this one.
                 prefix = secrets.randbits(192)
@@ -568,6 +568,15 @@ def main():
                     rates[message_in['device']] = message_in['hps']
                 if kind == 'found':
                     nonce = message_in['nonce']
+                    # A find carries the seed it was searching. When the seed
+                    # has moved since - somebody else minted while this nonce
+                    # was on its way out of the queue - the nonce is simply
+                    # worthless, not wrong, and the run drops it and carries
+                    # on. Checking it against the *current* seed and calling
+                    # the mismatch a broken GPU is how a correct card came to
+                    # look like a fault.
+                    if message_in.get('seed') not in (None, state['seed']):
+                        continue
                     value = int.from_bytes(cpu_digest(state['seed'], address, nonce), 'big')
                     if value >= target_for(message_in['bits']):
                         raise RuntimeError(f'GPU {message_in["device"]} returned a nonce the CPU rejects')
