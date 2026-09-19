@@ -490,8 +490,15 @@ def main():
 
     rates, ready = {}, set()
     mined, lost, pending = 0, 0, []
+    # Counted rather than printed. A proof is found every few tens of
+    # milliseconds, so a line each buried the one line that matters.
+    stale, sent_count = 0, 0
     job, seen_block, sent_nonce = None, 0, None
-    last_poll, last_print, tx_nonce = 0., time.monotonic(), None
+    last_poll, last_print = 0., time.monotonic()
+    # Both are kept here rather than asked for at the moment of sending: the
+    # send path is the race, and a round trip on it loses the bill.
+    tx_nonce = int(chain.call('eth_getTransactionCount', [address, 'pending']), 16)
+    gas_price = int(int(chain.call('eth_gasPrice', []), 16) * 1.2) + 1
     try:
         while True:
             now = time.monotonic()
@@ -520,20 +527,20 @@ def main():
                         log(f'MINTED #{mined} -> {EXPLORER}{entry["hash"]}')
                     else:
                         lost += 1
-                        log(f'below the bar: the target moved first -> {EXPLORER}{entry["hash"]}')
-                    tx_nonce = None
-
+                        pass
                 if fresh:
+                    try:
+                        gas_price = int(int(chain.call('eth_gasPrice', []), 16) * 1.2) + 1
+                    except Exception:
+                        pass
                     if fresh['seed'] != state['seed']:
                         # Somebody minted, so the seed moved and every nonce in
                         # flight is worthless. Pick the new one up and carry on
                         # rather than stopping: on a live road this happens
                         # every few seconds, and stopping means mining once.
-                        log(f'bill {fresh["next"]} went to someone else;'
-                            f' new seed, {fresh["bits"]} bits, working again')
+
                         state = fresh
                         pending.clear()
-                        tx_nonce = None
                         job = dict(bits=fresh['bits'], seed=fresh['seed'])
                         dispatch(job)
                         continue
@@ -575,6 +582,7 @@ def main():
                     # the mismatch a broken GPU is how a correct card came to
                     # look like a fault.
                     if message_in.get('seed') not in (None, state['seed']):
+                        stale += 1
                         continue
                     value = int.from_bytes(cpu_digest(state['seed'], address, nonce), 'big')
                     if value >= target_for(message_in['bits']):
@@ -584,27 +592,17 @@ def main():
                     elif args.self_test:
                         log('self-test solution found; nothing sent')
                     else:
-                        # The seed, once more, from the chain. A proof is only
-                        # worth gas while the bill it was found for is still
-                        # unclaimed, and bills go about every second and a half
-                        # here - so between finding one and spending on it,
-                        # somebody else may already have taken it. Every
-                        # "below the bar: the target moved first" in the log
-                        # was gas paid to be told that. One read costs thirty
-                        # milliseconds and refuses the transaction instead.
-                        try:
-                            live = chain.call('eth_call',
-                                              [{'to': CONTRACT, 'data': SELECTOR['seed']}, 'latest'])
-                        except Exception:
-                            live = state['seed']
-                        if live != state['seed']:
-                            log('the bill went while this proof was in hand; nothing sent')
-                            continue
-                        if tx_nonce is None:
-                            tx_nonce = int(chain.call('eth_getTransactionCount',
-                                                      [address, 'pending']), 16)
+                        # Nothing is read here. A proof is found every few
+                        # tens of milliseconds and a bill lasts under a
+                        # second, so a round trip on this path is the race:
+                        # three of them - seed, nonce, gas price - cost more
+                        # than the bill was ever going to last, and the log
+                        # filled with proofs that went stale in hand. The seed
+                        # was already checked against the poll, the nonce is
+                        # counted locally, and the gas price is refreshed on
+                        # the poll like everything else.
                         tx = {'chainId': CHAIN_ID, 'to': CONTRACT, 'value': 0, 'gas': MINT_GAS,
-                              'gasPrice': int(int(chain.call('eth_gasPrice', []), 16) * 1.2) + 1,
+                              'gasPrice': gas_price,
                               'nonce': tx_nonce,
                               'data': SELECTOR['mine'] + f'{nonce:064x}'}
                         signed = account.sign_transaction(tx)
@@ -613,9 +611,13 @@ def main():
                             chain.broadcast('0x' + signed.raw_transaction.hex())
                             pending.append(dict(hash=sent, sent=time.monotonic()))
                             tx_nonce += 1
-                            log(f'sent a proof -> {EXPLORER}{sent}')
+                            sent_count += 1
                         except Exception as exc:
-                            tx_nonce = None
+                            try:
+                                tx_nonce = int(chain.call(
+                                    'eth_getTransactionCount', [address, 'pending']), 16)
+                            except Exception:
+                                pass
                             log(f'broadcast failed: {exc}')
                         last_poll = 0.
                         if args.max_mints and mined + len(pending) >= args.max_mints:
@@ -624,12 +626,15 @@ def main():
 
             if time.monotonic() - last_print >= 10 and rates:
                 total = sum(rates.values())
-                bits = job['bits'].bit_length() if job else 0
-                expect = f'{(2 ** job["bits"]) / total:.1f}s' if job and total else '?'
+                # `bits` is already a bit count. Taking bit_length() of it -
+                # carried over from ZEROS, where the field was a difficulty -
+                # printed 5 for a 25-bit bar and made the bar look trivial.
+                bits = job['bits'] if job else 0
+                expect = f'{(2 ** bits) / total:.2f}s' if bits and total else '?'
                 each = ' '.join(f'gpu{d}:{rates[d]/1e6:.0f}' for d in sorted(rates))
-                tally = f'minted {mined}' + (f', lost {lost}' if lost else '')
-                log(f'{total/1e9:.2f} GH/s over {len(rates)}/{len(devices)} GPU [{each}]'
-                    f' | ~{bits} bits | one every ~{expect} | {tally}')
+                log(f'{total/1e9:.2f} GH/s [{each}] | bill {state["next"]} at {bits} bits'
+                    f' | a proof every ~{expect} | sent {sent_count}, minted {mined},'
+                    f' lost {lost}, dropped {stale}')
                 last_print = time.monotonic()
     finally:
         stop.set()
