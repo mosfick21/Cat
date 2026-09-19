@@ -274,8 +274,12 @@ extern "C" __global__ void probe(const u64* base, u64 start, unsigned int count,
 extern "C" __global__ void search(const u64* base, const u64* target, u64 start, u64 count,
                                   unsigned int* found, u64* result){
   u64 stride=(u64)gridDim.x*blockDim.x;
+  // Reading *found before every hash put a dependent global load on the
+  // critical path of each one. A launch is sized to ~200 ms, so giving up
+  // 255 hashes late costs microseconds and buys back the load.
+  unsigned int tick=0;
   for(u64 i=(u64)blockIdx.x*blockDim.x+threadIdx.x;i<count;i+=stride){
-    if(*found) return;
+    if((tick++ & 255u)==0u && *found) return;
     u64 h[4]; u64 nonce=start+i;
     digest(base,nonce,h);
     bool pass=false;
@@ -366,14 +370,15 @@ def worker(device, seed_hex, address, jobs, results, stop, options):
         batch = options['batch']
         counted, reported = 0, time.monotonic()
         while not stop.is_set():
-            try:
-                job = jobs.get(timeout=.2)
-                while True:
-                    try: job = jobs.get_nowait()
-                    except queue.Empty: break
-            except queue.Empty:
-                pass
+            # Never wait for a job. Waiting .2 s for one while a launch also
+            # takes .2 s left this GPU idle half the time, and the printed rate
+            # counted the idle half - 0.44 GH/s was 0.88 GH/s at 50% duty.
+            # The job in hand stays valid until a newer one is there to take.
+            while True:
+                try: job = jobs.get_nowait()
+                except queue.Empty: break
             if job is None:
+                time.sleep(.01)
                 continue
             if job.get('seed') and job['seed'] != current:
                 current = job['seed']
