@@ -44,6 +44,7 @@ import os
 import queue
 import secrets
 import sys
+import threading
 import time
 
 # Run from a notebook cell (`%run`), `__main__` has no `__spec__`, and
@@ -410,9 +411,13 @@ def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument('--gpus', default='all', help='all, or comma-separated indices')
     parser.add_argument('--rpc', action='append', help='repeat for more endpoints')
-    parser.add_argument('--batch-ms', type=float, default=200, help='target GPU launch duration')
+    parser.add_argument('--batch-ms', type=float, default=25,
+                        help='target GPU launch duration. A found nonce is only reported when'
+                             ' the launch it was found in ends, so this is dead time on the'
+                             ' one path that decides the bill: at 200 ms a proof sat in the'
+                             ' card for 100 ms on average, one whole Robinhood block.')
     parser.add_argument('--blocks', type=int, default=2048, help='thread blocks per launch')
-    parser.add_argument('--poll', type=float, default=.2,
+    parser.add_argument('--poll', type=float, default=.12,
                         help='seconds between chain reads. A bill lasts about a second and a half'
                              ' and the work in flight dies with it, so this is the whole race:'
                              ' at 2 s the cards spent most of every bill on a seed already gone.')
@@ -518,89 +523,112 @@ def main():
     spent_on = None
     # Proofs the chain itself refused before a fee was paid on them.
     refused = 0
-    job, seen_block, sent_nonce = None, 0, None
-    last_poll, last_print = 0., time.monotonic()
+    job, sent_nonce = None, None
+    last_print = time.monotonic()
     # Both are kept here rather than asked for at the moment of sending: the
     # send path is the race, and a round trip on it loses the bill.
     tx_nonce = int(chain.call('eth_getTransactionCount', [address, 'pending']), 16)
     gas_price = int(int(chain.call('eth_gasPrice', []), 16) * args.gas_multiple) + 1
-    # The state read runs several times a second now. These two do not have to:
+    # The state read runs several times a second. These two do not have to:
     # the base fee moves slowly and a receipt is not worth a round trip at the
-    # pace of the race.
-    last_gas, last_receipts = time.monotonic(), 0.
+    # pace of the race. Both live on the watching thread.
+    # The road is watched on its own thread, and this is not tidiness. A find
+    # has to be signed and broadcast the instant it arrives: the measurement
+    # that says so is 23 blocks of the live road with a mint in each and only
+    # one of them holding two bids, so bills are not lost to a higher fee in
+    # the same block - they are lost by turning up a block late. A state read
+    # is 26 ms and a receipt another; behind them a proof sat waiting for the
+    # one thread that could spend it.
+    road = dict(state=state, gas=gas_price, unlock=None, mined=0, lost=0,
+                sold_out=False, stop=False)
+    road_lock = threading.Lock()
+
+    def watch():
+        seen, gas_at, receipts_at = 0, time.monotonic(), 0.
+        while not road['stop']:
+            began = time.monotonic()
+            try:
+                fresh = chain.state(start_bits, opens_at)
+            except Exception as exc:
+                fresh = None
+            fresh, seen = accept_state(fresh, seen)
+            if fresh:
+                with road_lock:
+                    road['state'] = fresh
+                    if fresh['minted'] >= fresh['supply']:
+                        road['sold_out'] = True
+            if began - gas_at >= 5.:
+                gas_at = began
+                try:
+                    with road_lock:
+                        road['gas'] = int(int(chain.call('eth_gasPrice', []), 16)
+                                          * args.gas_multiple) + 1
+                except Exception:
+                    pass
+            if pending and began - receipts_at >= 1.:
+                receipts_at = began
+                for entry in list(pending):
+                    try:
+                        receipt = chain.call('eth_getTransactionReceipt', [entry['hash']])
+                    except Exception:
+                        continue
+                    if not receipt:
+                        if began - entry['sent'] > 120:
+                            pending.remove(entry)
+                            log(f'no receipt for {entry["hash"][:14]}... after two minutes')
+                        continue
+                    pending.remove(entry)
+                    if int(receipt['status'], 16) == 1:
+                        with road_lock:
+                            road['mined'] += 1
+                            won = road['mined']
+                        log(f'MINTED #{won} -> {EXPLORER}{entry["hash"]}')
+                    else:
+                        with road_lock:
+                            road['lost'] += 1
+                            # A revert on a bill nobody else took: the proof is
+                            # still good and the lock on that seed comes off.
+                            road['unlock'] = entry.get('seed')
+            rest = args.poll - (time.monotonic() - began)
+            if rest > 0:
+                time.sleep(rest)
+
+    watcher = threading.Thread(target=watch, daemon=True)
+    watcher.start()
     try:
         while True:
-            now = time.monotonic()
-            if now - last_poll >= args.poll:
-                last_poll = now
-                try:
-                    fresh = chain.state(start_bits, opens_at)
-                except Exception as exc:
-                    log(f'state read {type(exc).__name__}; keeping the last job')
-                    fresh = None
-                fresh, seen_block = accept_state(fresh, seen_block)
-
-                if pending and now - last_receipts >= 1.:
-                    last_receipts = now
-                    for entry in list(pending):
-                        try:
-                            receipt = chain.call('eth_getTransactionReceipt', [entry['hash']])
-                        except Exception:
-                            continue
-                        if not receipt:
-                            if now - entry['sent'] > 120:
-                                pending.remove(entry)
-                                log(f'no receipt for {entry["hash"][:14]}... after two minutes')
-                            continue
-                        pending.remove(entry)
-                        if int(receipt['status'], 16) == 1:
-                            mined += 1
-                            log(f'MINTED #{mined} -> {EXPLORER}{entry["hash"]}')
-                        else:
-                            lost += 1
-                            # A revert on a bill we bid for and did not get. The
-                            # seed has moved with it, so there is nothing to
-                            # retry; but if it has not - the revert was ours
-                            # alone - the bill is still there to be won and the
-                            # lock on this seed comes off.
-                            if spent_on == state['seed'] and entry.get('seed') == state['seed']:
-                                spent_on = None
-                if fresh:
-                    if now - last_gas >= 5.:
-                        last_gas = now
-                        try:
-                            gas_price = int(int(chain.call('eth_gasPrice', []), 16) * args.gas_multiple) + 1
-                        except Exception:
-                            pass
-                    if fresh['seed'] != state['seed']:
-                        # Somebody minted, so the seed moved and every nonce in
-                        # flight is worthless. Pick the new one up and carry on
-                        # rather than stopping: on a live road this happens
-                        # every few seconds, and stopping means mining once.
-
-                        #
-                        # What is *not* cleared here is `pending`. It was, and
-                        # the seed moves the instant a bill is taken - our own
-                        # win moves it too, so every mint this file ever landed
-                        # had its receipt thrown away one poll later and the
-                        # run reported "minted 0" while the bills sat in the
-                        # wallet. The nonces in flight are worthless; their
-                        # receipts are the only word we get.
-                        state = fresh
-                        spent_on = None
-                        job = dict(bits=fresh['bits'], seed=fresh['seed'])
-                        dispatch(job)
-                        continue
-                    if fresh['minted'] >= fresh['supply']:
-                        log(f'SOLD OUT at {fresh["minted"]}/{fresh["supply"]}.'
-                            f' Stopping; minted {mined}, lost {lost}.')
-                        return
-                    if job is None or fresh['bits'] != job['bits']:
-                        job = dict(bits=fresh['bits'], seed=fresh['seed'])
-                        dispatch(job)
+            with road_lock:
+                fresh, gas_price = road['state'], road['gas']
+                unlock, mined, lost = road['unlock'], road['mined'], road['lost']
+                sold_out = road['sold_out']
+                road['unlock'] = None
+            if unlock is not None and unlock == spent_on:
+                spent_on = None
+            if fresh['seed'] != state['seed']:
+                # Somebody minted, so the seed moved and every nonce in flight
+                # is worthless. Pick the new one up and carry on rather than
+                # stopping: on a live road this happens every second or two,
+                # and stopping means mining once.
+                #
+                # What is not cleared here is `pending`. It was, and the seed
+                # moves the instant a bill is taken - our own win moves it too,
+                # so every mint this file ever landed had its receipt thrown
+                # away one poll later and the run reported "minted 0" while the
+                # bills sat in the wallet.
+                state = fresh
+                spent_on = None
+                job = dict(bits=fresh['bits'], seed=fresh['seed'])
+                dispatch(job)
+            elif job is None or fresh['bits'] != job['bits']:
+                job = dict(bits=fresh['bits'], seed=fresh['seed'])
+                dispatch(job)
+            if sold_out:
+                log(f'SOLD OUT at {fresh["minted"]}/{fresh["supply"]}.'
+                    f' Stopping; minted {mined}, lost {lost}.')
+                return
 
             try:
-                message_in = results.get(timeout=.2)
+                message_in = results.get(timeout=.05)
             except queue.Empty:
                 message_in = None
 
@@ -692,7 +720,6 @@ def main():
                             except Exception:
                                 pass
                             log(f'broadcast failed: {exc}')
-                        last_poll = 0.
                         if args.max_mints and mined + len(pending) >= args.max_mints:
                             log(f'reached the mint limit; minted {mined}')
                             return
@@ -705,11 +732,14 @@ def main():
                 bits = job['bits'] if job else 0
                 expect = f'{(2 ** bits) / total:.2f}s' if bits and total else '?'
                 each = ' '.join(f'gpu{d}:{rates[d]/1e6:.0f}' for d in sorted(rates))
+                with road_lock:
+                    mined, lost = road['mined'], road['lost']
                 log(f'{total/1e9:.2f} GH/s [{each}] | bill {state["next"]} at {bits} bits'
                     f' | a proof every ~{expect} | sent {sent_count}, minted {mined},'
                     f' lost {lost}, dropped {stale}, refused before paying {refused}')
                 last_print = time.monotonic()
     finally:
+        road['stop'] = True
         stop.set()
         for process in workers.values():
             process.join(timeout=1)
