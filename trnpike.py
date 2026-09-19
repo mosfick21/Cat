@@ -372,16 +372,9 @@ def main():
     args = parser.parse_args()
     os.umask(0o077)
 
-    chain = Chain(args.rpc or RPCS)
-    state = chain.state()
-    if int(state['seed'], 16) == 0:
-        raise SystemExit('The seed is not revealed yet; there is nothing to mine.')
-    log(f'bills {state["next"]}/{SUPPLY} | work {state["bits"]} bits'
-        f' (~{2 ** state["bits"] / 1e9:,.2f} billion hashes)'
-        f' | road {"open" if state["open"] else "CLOSED"}')
-    if state['minted'] >= state['supply']:
-        raise SystemExit('Sold out. Nothing left to mine.')
-
+    # The key first, before anything touches the network. On Kaggle the prompt
+    # is the only thing the operator can act on, and a prompt that appears
+    # after a chain read looks like the script has hung - or scrolls past.
     account = None
     if args.self_test:
         address = '0x' + '11' * 20
@@ -407,6 +400,17 @@ def main():
         address = account.address
         del key
         log('mining for ' + address)
+
+    chain = Chain(args.rpc or RPCS)
+    state = chain.state()
+    if int(state['seed'], 16) == 0:
+        raise SystemExit('The seed is not revealed yet; there is nothing to mine.')
+    log(f'bills {state["next"]}/{SUPPLY} | work {state["bits"]} bits'
+        f' (~{2 ** state["bits"] / 1e9:,.2f} billion hashes)'
+        f' | road {"open" if state["open"] else "CLOSED"}')
+    if state['minted'] >= state['supply']:
+        raise SystemExit('Sold out. Nothing left to mine.')
+
 
     if args.gpus == 'all':
         import cupy as cp
